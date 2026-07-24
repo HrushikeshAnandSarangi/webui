@@ -54,7 +54,12 @@ import type {
   TemplateNodePath,
 } from './template.js';
 import { hydrationStart, hydrationEnd } from './lifecycle.js';
-import { syncRepeat, dotWalk } from './element/diff.js';
+import {
+  createRepeatKeyState,
+  seedHydratedRepeatKeys,
+  syncRepeat,
+  dotWalk,
+} from './element/diff.js';
 import {
   collectItemMarkers,
   nextElement,
@@ -70,13 +75,13 @@ import {
   ATTR_KIND_BOOLEAN,
   ATTR_KIND_COMPLEX,
   ATTR_KIND_TEMPLATE,
+  hasNativeLiveProperty,
 } from './element/types.js';
 import { templateHasRoot, templateRootForAttribute } from './template-roots.js';
 import type {
   AttrBinding,
   CondBinding,
   RepeatBinding,
-  RepeatItemInstance,
   ScopeFrame,
   TemplateInstance,
   TextBinding,
@@ -420,9 +425,14 @@ export class TemplateElement extends HTMLElement {
       this.$updateInstance(this.$root);
       if (this.$root.repeats.length !== 0 || this.$root.conds.length !== 0) {
         this.$root.nodes = childNodesArray(clientRoot);
-        this.$releaseStagingRepeatContainers(this.$root, clientRoot);
+        this.$replaceInstanceContainer(
+          this.$root,
+          clientRoot,
+          root as ParentNode & Node,
+        );
       }
       this.$appendStagedChildren(root, clientRoot);
+      this.$root.container = root as ParentNode & Node;
     }
 
     hydrationEnd();
@@ -450,7 +460,7 @@ export class TemplateElement extends HTMLElement {
       this.$hasUnknownScopes = false;
       return;
     }
-    this.$teardown(this.$root);
+    this.$disposeInstance(this.$root, false);
     this.$root = null;
     this.$pathIndex = undefined;
     this.$wildcardBindings = undefined;
@@ -461,33 +471,28 @@ export class TemplateElement extends HTMLElement {
     this.$hasUnknownScopes = false;
   }
 
-  /** Break all DOM references held by a binding instance and its nested blocks. */
-  private $teardown(instance: TemplateInstance): void {
-    this.$teardownInstanceCleanups(instance);
-    for (const c of instance.conds) {
-      if (c.instance) this.$teardown(c.instance);
-      c.instance = null;
+  private $clearRepeatBinding(repeat: RepeatBinding): void {
+    repeat.instances.length = 0;
+    repeat.container = null;
+    repeat.start = null;
+    repeat.end = null;
+    const state = repeat.keyState;
+    if (state) {
+      state.keys.length = 0;
+      state.nextKeys.length = 0;
+      state.map.clear();
     }
-    for (const r of instance.repeats) {
-      for (const item of r.instances) this.$teardown(item.instance);
-      r.instances.length = 0;
-      r.container = null;
-      r.start = null;
-      r.end = null;
-    }
+  }
+
+  private $clearInstance(instance: TemplateInstance): void {
+    instance.scope = undefined;
+    instance.parent = undefined;
+    instance.container = null;
     instance.nodes.length = 0;
     instance.texts.length = 0;
     instance.attrs.length = 0;
     instance.conds.length = 0;
     instance.repeats.length = 0;
-  }
-
-  /** Run listener cleanup attached directly to one template instance. */
-  private $teardownInstanceCleanups(instance: TemplateInstance): void {
-    const cleanups = instance.cleanups;
-    if (!cleanups) return;
-    for (let i = 0; i < cleanups.length; i++) cleanups[i]();
-    cleanups.length = 0;
   }
 
   attributeChangedCallback(
@@ -712,11 +717,13 @@ export class TemplateElement extends HTMLElement {
 
   /** Flush all queued path updates. Handles re-entrant setter calls. */
   private $flush(): void {
-    if (!this.$ready || !this.$root || !this.$pathIndex) {
+    if (!this.$ready || !this.$root) {
       this.$dirtyPaths = null;
       this.$pendingFlush = false;
       return;
     }
+    if (!this.$pathIndex) this.$buildPathIndex();
+    if (!this.$pathIndex) return;
 
     while (this.$dirtyPaths && this.$dirtyPaths.size > 0) {
       // Snapshot and clear so re-entrant setters get a fresh set.
@@ -724,16 +731,19 @@ export class TemplateElement extends HTMLElement {
       this.$dirtyPaths = null;
 
       for (const path of dirty) {
-        const entry = this.$pathIndex.get(path);
+        if (!this.$pathIndex) this.$buildPathIndex();
+        const entry = this.$pathIndex?.get(path);
         if (entry) {
           this.$updateBindings(entry.texts, entry.attrs, entry.conds, entry.repeats);
         }
       }
       // Update wildcard bindings once per flush (not per dirty path)
+      if (!this.$pathIndex) this.$buildPathIndex();
       if (this.$wildcardBindings) {
         const wc = this.$wildcardBindings;
         this.$updateBindings(wc.texts, wc.attrs, wc.conds, wc.repeats);
       }
+      if (!this.$pathIndex) this.$buildPathIndex();
     }
 
     this.$pendingFlush = false;
@@ -911,23 +921,26 @@ export class TemplateElement extends HTMLElement {
     root.appendChild(fragment);
   }
 
-  private $releaseStagingRepeatContainers(instance: TemplateInstance | null, stagingRoot: Node | null): void {
-    if (!instance || !stagingRoot) return;
-    if (instance.repeats.length === 0 && instance.conds.length === 0) return;
+  private $replaceInstanceContainer(
+    instance: TemplateInstance,
+    previous: (ParentNode & Node) | null,
+    next: (ParentNode & Node) | null,
+  ): void {
+    if (previous === next) return;
     const stack: TemplateInstance[] = [instance];
     while (stack.length > 0) {
       const current = stack.pop();
       if (!current) continue;
-      for (let i = 0; i < current.repeats.length; i++) {
-        const repeat = current.repeats[i];
-        if (repeat.container === stagingRoot) repeat.container = null;
-        for (let j = 0; j < repeat.instances.length; j++) {
-          stack.push(repeat.instances[j].instance);
-        }
-      }
+      if (current.container === previous) current.container = next;
       for (let i = 0; i < current.conds.length; i++) {
         const child = current.conds[i].instance;
         if (child) stack.push(child);
+      }
+      for (let i = 0; i < current.repeats.length; i++) {
+        const repeat = current.repeats[i];
+        if (repeat.container === previous) repeat.container = next;
+        const children = repeat.instances;
+        for (let j = 0; j < children.length; j++) stack.push(children[j]);
       }
     }
   }
@@ -938,7 +951,7 @@ export class TemplateElement extends HTMLElement {
 
   private $wire(root: Node, meta: TemplateBlockMeta, scope?: ScopeFrame): TemplateInstance {
     const instance: TemplateInstance = {
-      scope, nodes: childNodesArray(root),
+      scope, container: root as ParentNode & Node, nodes: childNodesArray(root),
       texts: [], attrs: [], conds: [], repeats: [],
     };
 
@@ -978,16 +991,30 @@ export class TemplateElement extends HTMLElement {
     }
 
     // Pre-resolve repeat slots
-    type RepRef = { parent: Node; ref: Node | null; collection: string; itemVar: string; blockIndex: number };
+    type RepRef = {
+      parent: Node;
+      ref: Node | null;
+      collection: string;
+      itemVar: string;
+      blockIndex: number;
+      keyPath?: string;
+    };
     const repRefs = new Array<RepRef>(meta.r?.length ?? 0);
     let repRefCount = 0;
     if (meta.r) {
       for (let i = 0; i < meta.r.length; i++) {
-        const [collection, itemVar, blockIndex, slotMeta] = meta.r[i];
+        const [collection, itemVar, blockIndex, slotMeta, keyPath] = meta.r[i];
         const [parentPath, beforeIndex] = slotMeta;
         const parent = parentPath.length > 0 ? this.$resolve(root, parentPath) : root;
         if (!parent || (parent.nodeType !== 1 && parent.nodeType !== 11)) continue;
-        repRefs[repRefCount] = { parent, ref: parent.childNodes[beforeIndex] || null, collection, itemVar, blockIndex };
+        repRefs[repRefCount] = {
+          parent,
+          ref: parent.childNodes[beforeIndex] || null,
+          collection,
+          itemVar,
+          blockIndex,
+          keyPath,
+        };
         repRefCount += 1;
       }
     }
@@ -1025,7 +1052,14 @@ export class TemplateElement extends HTMLElement {
       const c = condRefs[i];
       const anchor = document.createComment('');
       c.parent.insertBefore(anchor, c.ref);
-      instance.conds.push({ condition: c.condition, blockIndex: c.blockIndex, anchor, scope, instance: null });
+      instance.conds.push({
+        condition: c.condition,
+        blockIndex: c.blockIndex,
+        anchor,
+        scope,
+        owner: instance,
+        instance: null,
+      });
     }
 
     // Repeat bindings
@@ -1033,13 +1067,15 @@ export class TemplateElement extends HTMLElement {
       const r = repRefs[i];
       const anchor = document.createComment('');
       r.parent.insertBefore(anchor, r.ref);
-      const { keyAttribute, keyPath } = this.$repeatMaps(r.blockIndex, r.itemVar);
-      instance.repeats.push({
+      const binding: RepeatBinding = {
         markerId: i, collection: r.collection, itemVar: r.itemVar, blockIndex: r.blockIndex,
         container: r.parent as ParentNode & Node, start: anchor, end: null,
-        scope, owner: instance, instances: [], rootTag: null,
-        keyAttribute, keyPath,
-      });
+        scope, owner: instance, instances: [],
+      };
+      if (r.keyPath !== undefined) {
+        binding.keyState = createRepeatKeyState(r.keyPath);
+      }
+      instance.repeats.push(binding);
     }
 
     // Evaluate conditionals and repeats inline so blocks are created
@@ -1072,6 +1108,7 @@ export class TemplateElement extends HTMLElement {
   ): TemplateInstance {
     const instance: TemplateInstance = {
       scope,
+      container: (pathStart > 0 ? ssrRoot.parentNode : ssrRoot) as (ParentNode & Node) | null,
       nodes: pathStart > 0 ? [ssrRoot] : childNodesArray(ssrRoot),
       texts: [], attrs: [], conds: [], repeats: [],
     };
@@ -1156,6 +1193,7 @@ export class TemplateElement extends HTMLElement {
         // than claiming the first static sibling after <!--/wc-->.
         if (marker && blockMeta) {
           condInstance = this.$hydrateCondContent(condAnchor, blockMeta, scope);
+          if (condInstance) condInstance.parent = instance;
         }
 
         // Collect <!--/wc--> end marker for deferred removal.
@@ -1172,7 +1210,7 @@ export class TemplateElement extends HTMLElement {
         instance.conds.push({
           condition: condition as CompiledCondition, blockIndex,
           anchor: condAnchor,
-          scope, instance: condInstance,
+          scope, owner: instance, instance: condInstance,
         });
       }
     }
@@ -1182,7 +1220,7 @@ export class TemplateElement extends HTMLElement {
       let lastRepMarker: Node | null = null;
       let lastRepParent: Node | null = null;
       for (let i = 0; i < meta.r.length; i++) {
-        const [collection, itemVar, blockIndex, slotMeta] = meta.r[i];
+        const [collection, itemVar, blockIndex, slotMeta, keyPath] = meta.r[i];
         const [parentPath] = slotMeta;
         const ssrParent = this.$resolveSSR(ssrRoot, tplDom, parentPath, pathStart) ?? ssrRoot;
 
@@ -1191,9 +1229,7 @@ export class TemplateElement extends HTMLElement {
           lastRepMarker = null;
           lastRepParent = ssrParent;
         }
-
         const blockMeta = this.$block(blockIndex);
-        const { keyAttribute, keyPath } = this.$repeatMaps(blockIndex, itemVar);
         const blockTplDom = blockMeta ? getTemplateDom(blockMeta) : null;
         const rootTag = blockMeta && blockTplDom?.childNodes.length === 1 && blockTplDom.children.length === 1
           ? this.$rootTag(blockMeta)
@@ -1215,7 +1251,7 @@ export class TemplateElement extends HTMLElement {
         }
         lastRepMarker = anchor;
 
-        const repeatInsts: RepeatItemInstance[] = [];
+        const repeatInsts: TemplateInstance[] = [];
         const hasCollectionState = this.$hasStateRoot(collection, scope);
         const itemsArr = this.$resolveValue(collection, scope);
         const items = Array.isArray(itemsArr) ? itemsArr as unknown[] : [];
@@ -1249,11 +1285,9 @@ export class TemplateElement extends HTMLElement {
             if (rootTag) {
               const itemEl = nextElement(itemMarkers[j]);
               if (itemEl) {
-                const key = keyAttribute !== undefined
-                  ? itemEl.getAttribute(keyAttribute)
-                  : String(j);
                 const childInstance = this.$hydrate(itemEl, blockMeta, blockTplDom, itemScope, 1);
-                repeatInsts.push({ key, value: itemValue, instance: childInstance });
+                childInstance.parent = instance;
+                repeatInsts.push(childInstance);
               }
             } else {
               const itemParent = itemMarkers[j].parentNode;
@@ -1266,6 +1300,7 @@ export class TemplateElement extends HTMLElement {
                 cursor = next;
               }
               const inst = this.$hydrate(wrapper, blockMeta, blockTplDom, itemScope);
+              inst.parent = instance;
               inst.nodes = childNodesArray(wrapper);
               let afterNode: Node = itemMarkers[j];
               for (let nodeIndex = 0; nodeIndex < inst.nodes.length; nodeIndex++) {
@@ -1273,12 +1308,14 @@ export class TemplateElement extends HTMLElement {
                 itemParent?.insertBefore(node, afterNode.nextSibling);
                 afterNode = node;
               }
-              const key = keyPath
-                ? (j < items.length
-                  ? String(dotWalk(itemValue, keyPath, 0) ?? '')
-                  : `\u0000ssr:${j}`)
-                : null;
-              repeatInsts.push({ key, value: itemValue, instance: inst });
+              if (itemParent) {
+                this.$replaceInstanceContainer(
+                  inst,
+                  wrapper,
+                  itemParent as ParentNode & Node,
+                );
+              }
+              repeatInsts.push(inst);
             }
           }
 
@@ -1292,15 +1329,20 @@ export class TemplateElement extends HTMLElement {
         // Defer <!--/wr--> end marker removal (including empty repeats).
         if (endMarker) staleMarkers.push(endMarker);
 
-        instance.repeats.push({
+        const binding: RepeatBinding = {
           markerId: i, collection, itemVar, blockIndex,
           container: (anchor.parentNode ?? ssrRoot) as ParentNode & Node,
           start: anchor, end: null,
-          scope, owner: instance, instances: repeatInsts, rootTag,
-          keyAttribute,
-          keyPath,
+          scope, owner: instance, instances: repeatInsts,
           synced: hasCollectionState,
-        });
+        };
+        if (keyPath !== undefined) {
+          binding.keyState = createRepeatKeyState(keyPath);
+          if (hasCollectionState) {
+            seedHydratedRepeatKeys(binding, items);
+          }
+        }
+        instance.repeats.push(binding);
       }
     }
 
@@ -1314,6 +1356,7 @@ export class TemplateElement extends HTMLElement {
     for (let i = 0; i < staleMarkers.length; i++) {
       staleMarkers[i].parentNode?.removeChild(staleMarkers[i]);
     }
+    this.$compactNodeArray(instance);
 
     return instance;
   }
@@ -1392,6 +1435,8 @@ export class TemplateElement extends HTMLElement {
       condAnchor.parentNode?.insertBefore(inst.nodes[cn], afterNode.nextSibling);
       afterNode = inst.nodes[cn];
     }
+    const container = condAnchor.parentNode as (ParentNode & Node) | null;
+    if (container) this.$replaceInstanceContainer(inst, wrapper, container);
     // Same as above — trust SSR DOM, skip binding evaluation.
     return inst;
   }
@@ -1522,45 +1567,6 @@ export class TemplateElement extends HTMLElement {
     return { element: el, name, kind: kind as number, path: (entry[2] as string) || '', scope };
   }
 
-  /** Build the first stable item-scoped key for a repeat block. */
-  private $repeatMaps(blockIndex: number, itemVar: string): {
-    keyAttribute?: string;
-    keyPath?: string;
-  } {
-    let keyAttribute: string | undefined;
-    let keyPath: string | undefined;
-    const bm = this.$block(blockIndex);
-    if (bm?.a && bm.ag) {
-      for (let g = 0; g < bm.ag.length; g++) {
-        const [tp, s, c] = bm.ag[g];
-        // tp.length === 0 means root of the block container;
-        // tp = [0] means the first (and typically only) child element,
-        // which IS the repeated root element in blocks like <todo-item>.
-        const isRoot = tp.length === 0 || (tp.length === 1 && tp[0] === 0);
-        if (isRoot) {
-          for (let j = 0; j < c; j++) {
-            const entry = bm.a[s + j];
-            if (entry) {
-              if (entry[1] === 0 || entry[1] === 3) {
-                const dp = this.$singleDynamic(
-                  entry[1] === 3 ? (entry[2] as CompiledAttrPart[]) : [[entry[2] as string]],
-                );
-                // Only use item-scoped paths as keys; outer-scope bindings
-                // (e.g. group.name inside <for each="opt in ...">) would
-                // resolve to the same value for every item and break keying.
-                if (dp && keyPath === undefined && dp.path.startsWith(itemVar + '.')) {
-                  keyAttribute = entry[0];
-                  keyPath = dp.path.slice(itemVar.length + 1);
-                }
-              }
-            }
-          }
-        }
-      }
-    }
-    return { keyAttribute, keyPath };
-  }
-
   // ═══════════════════════════════════════════════════════════════
   //  Reactive update system
   // ═══════════════════════════════════════════════════════════════
@@ -1636,7 +1642,7 @@ export class TemplateElement extends HTMLElement {
           ensure(keyFor(rep.collection)).repeats.push(rep);
         }
         for (let i = 0; i < rep.instances.length; i++) {
-          visit(rep.instances[i].instance);
+          visit(rep.instances[i]);
         }
       }
     };
@@ -1731,7 +1737,10 @@ export class TemplateElement extends HTMLElement {
         if (show) el.setAttribute(b.name, '');
         else el.removeAttribute(b.name);
         // Form control properties must be set via DOM property, not attribute
-        if (b.name === 'checked' || b.name === 'selected' || b.name === 'disabled') {
+        if (
+          (b.name === 'checked' || b.name === 'selected' || b.name === 'disabled')
+          && hasNativeLiveProperty(el, b.name)
+        ) {
           (el as unknown as Record<string, unknown>)[b.name] = show;
         }
         break;
@@ -1745,10 +1754,14 @@ export class TemplateElement extends HTMLElement {
         const v = this.$resolveValue(b.path!, b.scope);
         const s = v == null ? '' : String(v);
         // Form control properties diverge from attributes after user interaction
-        if (b.name === 'checked' || b.name === 'selected') {
+        if (
+          (b.name === 'checked' || b.name === 'selected')
+          && hasNativeLiveProperty(el, b.name)
+        ) {
           (el as unknown as Record<string, unknown>)[b.name] = !!v && v !== 'false' && v !== '0';
-        } else if (b.name === 'value') {
-          if ((el as HTMLInputElement).value !== s) (el as HTMLInputElement).value = s;
+        } else if (b.name === 'value' && hasNativeLiveProperty(el, b.name)) {
+          const target = el as Element & { value: unknown };
+          if (target.value !== s) target.value = s;
         } else {
           if (el.getAttribute(b.name) !== s) el.setAttribute(b.name, s);
         }
@@ -1760,19 +1773,27 @@ export class TemplateElement extends HTMLElement {
   private $toggleCond(c: CondBinding): void {
     const show = c.condition[0](this.$resolver, c.scope);
     if (show) {
+      let created = false;
+      const container = c.anchor.parentNode as (ParentNode & Node) | null;
       if (!c.instance) {
-        c.instance = this.$createBlockInstance(c.blockIndex, c.scope);
-        if (c.instance) {
-          const frag = document.createDocumentFragment();
-          for (const n of c.instance.nodes) frag.appendChild(n);
-          c.anchor.parentNode?.insertBefore(frag, c.anchor.nextSibling);
-        }
+        c.instance = this.$createBlockInstance(
+          c.blockIndex,
+          c.scope,
+          c.owner,
+          container ?? undefined,
+        );
+        created = c.instance !== null;
       } else {
         this.$updateInstance(c.instance);
+      }
+      if (c.instance && container) {
+        this.$insertInstanceAfter(c.anchor, container, c.instance);
+        if (created) this.$changeStructure();
       }
     } else if (c.instance) {
       this.$removeInstance(c.instance);
       c.instance = null;
+      this.$changeStructure(c.owner);
     }
   }
 
@@ -1844,50 +1865,92 @@ export class TemplateElement extends HTMLElement {
     return this.$meta?.b?.[blockIndex];
   }
 
-  $createBlockInstance(blockIndex: number, scope?: ScopeFrame): TemplateInstance | null {
+  $createBlockInstance(
+    blockIndex: number,
+    scope?: ScopeFrame,
+    parent?: TemplateInstance,
+    container?: ParentNode & Node,
+  ): TemplateInstance | null {
     const bm = this.$block(blockIndex);
     if (!bm) return null;
     const wrapper = this.$createStagingRoot(bm);
     const inst = this.$wire(wrapper, bm, scope);
+    inst.parent = parent;
     inst.nodes = childNodesArray(wrapper);
     this.$updateInstance(inst);
     if (inst.repeats.length !== 0 || inst.conds.length !== 0) {
       inst.nodes = childNodesArray(wrapper);
-      this.$releaseStagingRepeatContainers(inst, wrapper);
+      this.$replaceInstanceContainer(inst, wrapper, container ?? null);
+    } else if (container) {
+      inst.container = container;
     }
     return inst;
   }
 
   $removeInstance(instance: TemplateInstance): void {
-    this.$teardownInstanceCleanups(instance);
-    for (const n of instance.nodes) n.parentNode?.removeChild(n);
-    for (const c of instance.conds) {
-      if (c.instance) this.$removeInstance(c.instance);
-    }
-    for (const r of instance.repeats) {
-      for (const item of r.instances) this.$removeInstance(item.instance);
+    this.$disposeInstance(instance, true);
+  }
+
+  private $disposeInstance(root: TemplateInstance, removeNodes: boolean): void {
+    const stack: TemplateInstance[] = [root];
+    while (stack.length > 0) {
+      const instance = stack.pop();
+      if (!instance) continue;
+      const cleanups = instance.cleanups;
+      if (cleanups) {
+        for (const cleanup of cleanups) cleanup();
+        cleanups.length = 0;
+      }
+      if (removeNodes) {
+        for (const node of instance.nodes) node.parentNode?.removeChild(node);
+      }
+      for (const binding of instance.conds) {
+        if (binding.instance) stack.push(binding.instance);
+        binding.instance = null;
+      }
+      for (const repeat of instance.repeats) {
+        for (const child of repeat.instances) stack.push(child);
+        this.$clearRepeatBinding(repeat);
+      }
+      this.$clearInstance(instance);
     }
   }
 
+  private $compactNodeArray(instance: TemplateInstance): void {
+    const container = instance.container;
+    if (!container) return;
+    const nodes = instance.nodes;
+    let write = 0;
+    for (let read = 0; read < nodes.length; read++) {
+      const node = nodes[read];
+      if (node.parentNode === container) {
+        nodes[write] = node;
+        write++;
+      }
+    }
+    nodes.length = write;
+  }
+
+  $changeStructure(removedFrom?: TemplateInstance): void {
+    if (removedFrom) {
+      let current: TemplateInstance | undefined = removedFrom;
+      while (current) {
+        this.$compactNodeArray(current);
+        current = current.parent;
+      }
+    }
+    this.$pathIndex = undefined;
+    this.$wildcardBindings = undefined;
+  }
+
   $insertInstanceAfter(cursor: Node | null, container: ParentNode & Node, instance: TemplateInstance): Node | null {
+    this.$replaceInstanceContainer(instance, instance.container, container);
     const nodes = instance.nodes;
     if (nodes.length === 0) return cursor;
     const ref = cursor ? cursor.nextSibling : container.firstChild;
     if (nodes[0] === ref) return nodes[nodes.length - 1];
-    const frag = document.createDocumentFragment();
-    for (let i = 0; i < nodes.length; i++) frag.appendChild(nodes[i]);
-    container.insertBefore(frag, ref);
+    for (let i = 0; i < nodes.length; i++) container.insertBefore(nodes[i], ref);
     return nodes[nodes.length - 1];
   }
 
-  /** Extract the single dynamic path from a compiled attr parts array. */
-  private $singleDynamic(parts: CompiledAttrPart[]): { path: string; prefix: string; suffix: string } | null {
-    let path = ''; let prefix = ''; let suffix = ''; let seen = false;
-    for (const p of parts) {
-      if (typeof p === 'string') { if (seen) suffix += p; else prefix += p; continue; }
-      if (seen) return null;
-      path = p[0]; seen = true;
-    }
-    return seen ? { path, prefix, suffix } : null;
-  }
 }

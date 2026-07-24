@@ -45,6 +45,16 @@ export const ATTR_KIND_COMPLEX = 1;
 export const ATTR_KIND_BOOLEAN = 2;
 export const ATTR_KIND_TEMPLATE = 3;
 
+/**
+ * Return whether an attribute binding must update a native live DOM property.
+ *
+ * Autonomous custom elements contain a hyphen and use attribute semantics
+ * unless the template explicitly opts into a `:property` binding.
+ */
+export function hasNativeLiveProperty(element: Element, name: string): boolean {
+  return element.localName.indexOf('-') === -1 && name in element;
+}
+
 /** Direct reference to an attribute binding. */
 export interface AttrBinding {
   element: Element;
@@ -66,6 +76,8 @@ export interface ScopeFrame {
 
 export interface TemplateInstance {
   scope?: ScopeFrame;
+  parent?: TemplateInstance;
+  container: (ParentNode & Node) | null;
   nodes: Node[];
   texts: TextBinding[];
   attrs: AttrBinding[];
@@ -86,7 +98,18 @@ export interface CondBinding {
   blockIndex: number;
   anchor: Comment;
   scope?: ScopeFrame;
+  owner: TemplateInstance;
   instance: TemplateInstance | null;
+}
+
+export type RepeatKey = string | number;
+
+export interface RepeatKeyState {
+  path: string;
+  warned: boolean;
+  keys: RepeatKey[];
+  nextKeys: RepeatKey[];
+  map: Map<RepeatKey, TemplateInstance | null>;
 }
 
 /** Repeat block tracking. */
@@ -100,18 +123,10 @@ export interface RepeatBinding {
   end: Comment | null;
   scope?: ScopeFrame;
   owner: TemplateInstance;
-  instances: RepeatItemInstance[];
-  rootTag: string | null;
-  keyAttribute?: string;
-  keyPath?: string;
+  instances: TemplateInstance[];
+  keyState?: RepeatKeyState;
   /** Set to true once the collection has been explicitly set by client code. */
   synced?: boolean;
-}
-
-export interface RepeatItemInstance {
-  key: string | null;
-  value: unknown;
-  instance: TemplateInstance;
 }
 
 /**
@@ -125,8 +140,14 @@ export interface RepeatHost {
   $resolveValue(path: string, scope?: ScopeFrame): unknown;
   $hasStateRoot(path: string, scope?: ScopeFrame): boolean;
   /** Create, wire, and perform the first binding pass while detached. */
-  $createBlockInstance(blockIndex: number, scope?: ScopeFrame): TemplateInstance | null;
+  $createBlockInstance(
+    blockIndex: number,
+    scope?: ScopeFrame,
+    parent?: TemplateInstance,
+    container?: ParentNode & Node,
+  ): TemplateInstance | null;
   $updateInstance(instance: TemplateInstance): void;
   $removeInstance(instance: TemplateInstance): void;
+  $changeStructure(removedFrom?: TemplateInstance): void;
   $insertInstanceAfter(cursor: Node | null, container: ParentNode & Node, instance: TemplateInstance): Node | null;
 }
