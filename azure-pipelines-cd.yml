@@ -1,6 +1,10 @@
 trigger: none
 pr: none
 
+# Optional: set targetReleaseTag to a v-prefixed GitHub tag for manual reprocessing.
+variables:
+  targetReleaseTag: ''
+
 schedules:
   - cron: '0 * * * *'
     displayName: Hourly deployment check
@@ -42,10 +46,8 @@ extends:
     stages:
 
     # ── Stage 1: Lightweight version check (runs every hour, ~1-2 min) ──
-    # This stage is separate so that when no deployment is needed, the
-    # heavyweight Package stage (with all its 1ES SDL tasks) is skipped
-    # entirely — avoiding ~30 min of unnecessary agent provisioning and
-    # compliance scans on every hourly no-op run.
+    # This stage is separate so hourly runs can skip the heavyweight Package
+    # stage when the target release has already been deployed.
     - stage: Check
       jobs:
       - job: CheckVersion
@@ -55,10 +57,21 @@ extends:
 
           - task: DownloadGitHubRelease@0
             displayName: Download latest GitHub release
+            condition: and(succeeded(), eq(variables['targetReleaseTag'], ''))
             inputs:
               connection: fast
               userRepository: microsoft/webui
               defaultVersionType: 'latest'
+              downloadPath: '$(System.ArtifactsDirectory)'
+
+          - task: DownloadGitHubRelease@0
+            displayName: Download pinned GitHub release
+            condition: and(succeeded(), ne(variables['targetReleaseTag'], ''))
+            inputs:
+              connection: fast
+              userRepository: microsoft/webui
+              defaultVersionType: 'specificTag'
+              version: '$(targetReleaseTag)'
               downloadPath: '$(System.ArtifactsDirectory)'
 
           # Extract the version number from the downloaded .crate filename,
@@ -97,42 +110,58 @@ extends:
             displayName: Check if already deployed
             name: deploymentCheck
 
-    # ── Stage 2: Download artifacts and deploy (entirely skipped if already deployed) ──
+    # ── Stage 2: Deploy when needed; manual runs may reprocess the target tag ──
     - stage: Package
       dependsOn: Check
-      condition: eq(dependencies.Check.outputs['CheckVersion.deploymentCheck.needsDeployment'], 'true')
+      condition: and(succeeded(), or(eq(variables['Build.Reason'], 'Manual'), eq(dependencies.Check.outputs['CheckVersion.deploymentCheck.needsDeployment'], 'true')))
       variables:
         releaseTag: $[ stageDependencies.Check.CheckVersion.outputs['resolveTag.releaseTag'] ]
       jobs:
       - job: Deploy
+        templateContext:
+          outputs:
+            - output: pipelineArtifact
+              targetPath: '$(Build.ArtifactStagingDirectory)'
+              artifactName: nuget_packages
+              displayName: Publish signed NuGet packages
         steps:
           - checkout: self
             persistCredentials: "true"
 
+          - task: UseDotNet@2
+            displayName: Install .NET 8 SDK for ESRP
+            inputs:
+              packageType: sdk
+              version: '8.x'
+
           - task: DownloadGitHubRelease@0
-            displayName: Download GitHub release artifacts
+            displayName: Download checked GitHub release artifacts
             inputs:
               connection: fast
               userRepository: microsoft/webui
-              defaultVersionType: 'latest'
+              defaultVersionType: 'specificTag'
+              version: '$(releaseTag)'
               downloadPath: '$(System.ArtifactsDirectory)'
 
-          # Separate the downloaded files into the directories expected by the
-          # release pipeline template. .tgz → npm, .crate → crates.
-          # NuGet (.nupkg/.snupkg) is intentionally skipped here: artifacts
-          # stay on the GitHub Release for manual nuget.org publishing until
-          # ESRP supports automated NuGet publishing for this project. Manual
-          # publish still requires the approved owner account and signing/cert.
+          # Stage downloaded files in the directories expected by
+          # WebUI.Sign.PipelineTemplate.yml: .tgz → npm, .crate → crates, and
+          # .nupkg/.snupkg → NuGet.
           - script: |
-              mkdir -p publish_artifacts_npm publish_artifacts_crates
+              mkdir -p publish_artifacts_npm publish_artifacts_crates publish_artifacts_nuget
               find "$(System.ArtifactsDirectory)" -name "*.tgz"   -exec cp {} publish_artifacts_npm/   \;
               find "$(System.ArtifactsDirectory)" -name "*.crate" -exec cp {} publish_artifacts_crates/ \;
+              find "$(System.ArtifactsDirectory)" -name "*.nupkg" -exec cp {} publish_artifacts_nuget/ \;
+              find "$(System.ArtifactsDirectory)" -name "*.snupkg" -exec cp {} publish_artifacts_nuget/ \;
+
               echo "npm artifacts:"
               ls publish_artifacts_npm/
               echo "crate artifacts:"
               ls publish_artifacts_crates/
+              echo "NuGet artifacts:"
+              ls publish_artifacts_nuget/
             displayName: Separate release artifacts
 
+          - template: WebUI.Sign.PipelineTemplate.yml@webuiPipelines  # Template reference
           - template: WebUI.Release.PipelineTemplate.yml@webuiPipelines  # Template reference
 
           # Mark this version as deployed so future pipeline runs skip it.
