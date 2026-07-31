@@ -61,6 +61,8 @@ const SUPPORTED_EXTENSIONS = new Set([
 /** What a name bound in a module's local scope refers to. */
 type ScopeBinding =
   | { readonly kind: "localClass"; readonly node: ts.ClassLikeDeclaration }
+  | { readonly kind: "mutableClass" }
+  | { readonly kind: "localAlias"; readonly localName: string }
   | { readonly kind: "localOther" }
   | { readonly kind: "import"; readonly specifier: string; readonly importedName: string }
   | { readonly kind: "namespaceImport"; readonly specifier: string };
@@ -107,6 +109,7 @@ type Resolved =
   | { readonly kind: "frameworkAttr" }
   | { readonly kind: "frameworkElement" }
   | { readonly kind: "namespace"; readonly moduleId: string }
+  | { readonly kind: "unsafeMutable" }
   | { readonly kind: "other" }
   | { readonly kind: "unresolved"; readonly reason: "no-module" | "no-source" | "no-export" | "circular" };
 
@@ -350,82 +353,31 @@ class AnalysisRegistry {
 
 function containsPotentialDefineCall(node: ModuleNode): boolean {
   const source = node.source ?? "";
-  const hasFrameworkEdge = node.imports.some(
-    (edge) => edge.packageName === FRAMEWORK_SPECIFIER
-  );
-  let offset = 0;
-  while (offset < source.length) {
-    const found = source.indexOf("define", offset);
-    if (found < 0) return false;
-    const before = found === 0 ? -1 : source.charCodeAt(found - 1);
-    const afterIndex = found + "define".length;
+  const identifier = "define";
+  let offset = source.indexOf(identifier);
+  while (offset !== -1) {
+    const before = offset === 0 ? -1 : source.charCodeAt(offset - 1);
+    const afterOffset = offset + identifier.length;
     const after =
-      afterIndex === source.length
-        ? -1
-        : source.charCodeAt(afterIndex);
-    if (!isIdentifierCode(before) && !isIdentifierCode(after)) {
-      let dot = found;
-      while (dot > 0 && isWhitespaceCode(source.charCodeAt(dot - 1))) dot--;
-      if (dot > 0 && source.charCodeAt(dot - 1) === 46) {
-        let open = afterIndex;
-        while (
-          open < source.length &&
-          isWhitespaceCode(source.charCodeAt(open))
-        ) {
-          open++;
-        }
-        if (source.charCodeAt(open) === 40) {
-          let argument = open + 1;
-          while (
-            argument < source.length &&
-            isWhitespaceCode(source.charCodeAt(argument))
-          ) {
-            argument++;
-          }
-          const argumentCode = source.charCodeAt(argument);
-          if (
-            argumentCode === 34 ||
-            argumentCode === 39 ||
-            hasFrameworkEdge ||
-            receiverIdentifier(source, dot - 1) === "customElements"
-          ) {
-            return true;
-          }
-        }
-      }
+      afterOffset === source.length ? -1 : source.charCodeAt(afterOffset);
+    if (
+      !isAsciiIdentifierContinue(before) &&
+      !isAsciiIdentifierContinue(after)
+    ) {
+      return true;
     }
-    offset = found + "define".length;
+    offset = source.indexOf(identifier, afterOffset);
   }
   return false;
 }
 
-function receiverIdentifier(
-  source: string,
-  dotIndex: number
-): string {
-  let end = dotIndex;
-  while (end > 0 && isWhitespaceCode(source.charCodeAt(end - 1))) end--;
-  let start = end;
-  while (start > 0 && isIdentifierCode(source.charCodeAt(start - 1))) start--;
-  return source.slice(start, end);
-}
-
-function isWhitespaceCode(code: number): boolean {
-  return (
-    code === 9 ||
-    code === 10 ||
-    code === 13 ||
-    code === 32
-  );
-}
-
-function isIdentifierCode(code: number): boolean {
+function isAsciiIdentifierContinue(code: number): boolean {
   return (
     (code >= 48 && code <= 57) ||
     (code >= 65 && code <= 90) ||
+    code === 95 ||
     (code >= 97 && code <= 122) ||
-    code === 36 ||
-    code === 95
+    code === 36
   );
 }
 
@@ -613,18 +565,64 @@ function analyzeVariableStatement(
   exports: Map<string, ExportBinding>
 ): void {
   const exported = isExported(stmt);
+  const immutable =
+    (stmt.declarationList.flags & ts.NodeFlags.Const) !== 0;
   for (const decl of stmt.declarationList.declarations) {
     if (!ts.isIdentifier(decl.name)) continue;
     if (decl.initializer && ts.isClassExpression(decl.initializer)) {
       scope.set(decl.name.text, {
-        kind: "localClass",
-        node: decl.initializer,
+        ...(immutable
+          ? { kind: "localClass" as const, node: decl.initializer }
+          : { kind: "mutableClass" as const }),
       });
       if (exported) {
         exports.set(decl.name.text, {
           kind: "localRef",
           localName: decl.name.text,
         });
+      }
+    } else if (
+      immutable &&
+      decl.initializer &&
+      ts.isIdentifier(decl.initializer)
+    ) {
+      scope.set(decl.name.text, {
+        kind: "localAlias",
+        localName: decl.initializer.text,
+      });
+      if (exported) {
+        exports.set(decl.name.text, {
+          kind: "localRef",
+          localName: decl.name.text,
+        });
+      }
+    } else if (
+      immutable &&
+      decl.initializer &&
+      ts.isPropertyAccessExpression(decl.initializer) &&
+      ts.isIdentifier(decl.initializer.expression)
+    ) {
+      const namespace = scope.get(decl.initializer.expression.text);
+      if (namespace?.kind === "namespaceImport") {
+        scope.set(decl.name.text, {
+          kind: "import",
+          specifier: namespace.specifier,
+          importedName: decl.initializer.name.text,
+        });
+        if (exported) {
+          exports.set(decl.name.text, {
+            kind: "localRef",
+            localName: decl.name.text,
+          });
+        }
+      } else {
+        analyzeNamedOtherDeclaration(
+          decl.name.text,
+          exported,
+          false,
+          scope,
+          exports
+        );
       }
     } else {
       analyzeNamedOtherDeclaration(
@@ -739,6 +737,15 @@ function compileDefinedComponents(
       site.moduleId,
       site.classArg
     );
+    if (classResolution.kind === "unsafeMutable") {
+      diagnostics.push(
+        createDiagnostic("PROJ-C009", {
+          location: site.moduleId,
+          help: "Bind class expressions with const before calling define() so the projection compiler can prove the referenced class cannot change.",
+        })
+      );
+      continue;
+    }
     if (classResolution.kind !== "class") {
       // `.define()` is a common API outside Web Components. Unknown receivers
       // are ignored here; strict WebUI build coverage catches any real
@@ -1021,6 +1028,15 @@ function stepLocal(
   switch (binding.kind) {
     case "localClass":
       return { kind: "class", moduleId: cur.moduleId, node: binding.node };
+    case "mutableClass":
+      return { kind: "unsafeMutable" };
+    case "localAlias":
+      stack.push({
+        mode: "local",
+        moduleId: cur.moduleId,
+        name: binding.localName,
+      });
+      return undefined;
     case "localOther":
       return { kind: "other" };
     case "import": {
@@ -1358,6 +1374,7 @@ function buildManifest(
 
   const inputs = buildInputsMap(ctx);
   const outputs = buildOutputsMap(ctx);
+  const entryClosures = buildEntryClosuresMap(ctx);
   const analysisHash = computeAnalysisHash(ctx);
 
   const producerVersion = readProducerVersion();
@@ -1382,6 +1399,9 @@ function buildManifest(
             components[tag]!.navigationKeys,
           ] as const
       ),
+    ...(entryClosures
+      ? { sortedEntryClosures: Object.entries(entryClosures) }
+      : {}),
   });
 
   return {
@@ -1394,7 +1414,40 @@ function buildManifest(
     outputs,
     inputs,
     components,
+    ...(entryClosures ? { entryClosures } : {}),
   };
+}
+
+/**
+ * Canonicalizes adapter-reported entry closures to root-relative paths.
+ *
+ * Members that did not survive into `outputs` are dropped rather than
+ * diagnosed: an adapter may legitimately report an import graph wider than the
+ * outputs it hands to the compiler. Order is preserved exactly — it is the
+ * adapter's size ordering and re-deriving it here is not possible.
+ */
+function buildEntryClosuresMap(
+  ctx: AdapterContext
+): Record<string, ReadonlyArray<string>> | undefined {
+  const source = ctx.entryClosures;
+  if (!source || source.size === 0) return undefined;
+
+  const entries: Array<[string, ReadonlyArray<string>]> = [];
+  for (const [entryId, closure] of source) {
+    if (!ctx.membership.outputs.has(entryId)) continue;
+    const members: string[] = [];
+    for (const memberId of closure) {
+      if (memberId === entryId) continue;
+      if (!ctx.membership.outputs.has(memberId)) continue;
+      members.push(canonicalOutputId(ctx, memberId));
+    }
+    // Empty closures are semantic ownership records. Keeping them prevents a
+    // same-basename entry from another manifest from being selected by mistake.
+    entries.push([canonicalOutputId(ctx, entryId), members]);
+  }
+  if (entries.length === 0) return undefined;
+  entries.sort((left, right) => compareUtf8(left[0], right[0]));
+  return Object.fromEntries(entries);
 }
 
 function findOutputsContaining(ctx: AdapterContext, moduleId: string): string[] {

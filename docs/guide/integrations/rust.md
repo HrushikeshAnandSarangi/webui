@@ -155,13 +155,19 @@ async fn main() {
 
 ## Streaming SSR
 
-For production, prefer the framework-provided `webui::streaming::StreamingWriter` over a hand-rolled `String` buffer. It coalesces small writes into ~4 KB chunks, ships them over a **bounded** `tokio::mpsc` channel (backpressure on slow clients), and recycles chunk buffers through a shared `ChunkPool` so steady-state RPS does zero per-flush allocation.
+`webui::streaming::StreamingWriter` coalesces small writes, sends them over a
+bounded `tokio::mpsc` channel for backpressure, and can recycle buffers through
+a shared `ChunkPool`. You can use it with `WebUIHandler::render` for transport
+streaming. To make authored `<boundary>` checkpoints hydrate before the
+response completes, call the opt-in `WebUIHandler::render_streaming` API shown
+below. It commits every boundary as final. Use `stream_response` when backend
+readiness controls checkpoint timing or an island needs later server state.
 
 ```rust
 use std::sync::Arc;
 use std::time::Duration;
 use bytes::Bytes;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 use tokio_stream::StreamExt;
 use webui::streaming::{ChunkPool, StreamingWriter};
 use webui::{WebUIHandler, RenderOptions, ResponseWriter};
@@ -171,21 +177,32 @@ let chunk_pool = Arc::new(ChunkPool::new(
     256,                                       // ~1.25 MiB peak pool memory
     StreamingWriter::CHUNK_TARGET + 1024,
 ));
+let render_permits = Arc::new(Semaphore::new(4));
 
 // Per request:
+// Acquire before `spawn_blocking`; its internal queue is not an admission limit.
+let render_permit = match Arc::clone(&render_permits).try_acquire_owned() {
+    Ok(permit) => permit,
+    Err(_) => {
+        return HttpResponse::ServiceUnavailable()
+            .insert_header(("Retry-After", "1"))
+            .body("streaming render capacity is temporarily exhausted");
+    }
+};
 let (tx, rx) = mpsc::channel::<Bytes>(StreamingWriter::DEFAULT_CHANNEL_CAPACITY);
 actix_web::rt::task::spawn_blocking({
     let chunk_pool = Arc::clone(&chunk_pool);
     move || {
+        let _render_permit = render_permit;
         // `with_flush_timeout` bounds the slow-loris DoS surface to
         // `30s × concurrent_renders`. `end()` returns the typed error
-        // from the final flush — log truncated streams at debug.
+        // from the final flush. Log truncated streams at debug.
         let mut writer = StreamingWriter::new_pooled(tx, chunk_pool)
             .with_flush_timeout(Duration::from_secs(30));
         let options = RenderOptions::new("index.html", &request_path)
             .with_nonce(&csp_nonce)
             .with_body_inject(&livereload_script); // per-request inject
-        if let Err(e) = handler.render(&proto, &state, &options, &mut writer) {
+        if let Err(e) = handler.render_streaming(&proto, &state, &options, &mut writer) {
             log::error!("render failed: {e}");
             if let Err(flush_error) = ResponseWriter::end(&mut writer) {
                 log::debug!("stream truncated: {flush_error}");
@@ -198,15 +215,107 @@ HttpResponse::Ok()
     .streaming(tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, actix_web::Error>))
 ```
 
+### Host-driven boundaries and state updates
+
+`stream_response` returns a synchronous response session. Resolve authored names
+once, then use integer handles for every write:
+
+```rust
+use webui::{BoundaryMode, RenderOptions, WebUIHandler};
+
+let options = RenderOptions::new("index.html", "/");
+let mut response = handler.stream_response(&protocol, &options, &mut writer)?;
+let weather = response.boundary("weather-shell")?;
+let composer = response.boundary("composer-ready")?;
+let feed_1 = response.boundary("feed-batch-1")?;
+
+response.write_shell(&page_state)?;
+response.write_boundary(weather, &loading_weather, BoundaryMode::Updatable)?;
+response.write_boundary(composer, &composer_state, BoundaryMode::Final)?;
+
+// Await or receive backend work between these synchronous calls.
+response.update(weather, &ready_weather)?;
+response.write_boundary(feed_1, &feed_state, BoundaryMode::Final)?;
+response.finish(&tail_state)?;
+```
+
+Boundary HTML must be written once in declaration order. `update` can be called
+between any two boundary writes, but only for a committed `Updatable` boundary.
+It applies the same compiled state projection as that boundary's initial
+checkpoint, requires a JSON object, emits no marker range, and flushes
+immediately. `finish` requires all compiled boundaries to be committed.
+
+The session borrows each state value only for its call. It does not await,
+allocate a task, or synchronize concurrent callers. An async server should use a
+bounded command channel and one admitted blocking worker that owns the session
+and `StreamingWriter`; `examples/app/streaming` is the reference implementation.
+
+The public writer contract is:
+
+```rust
+pub trait FlushWriter: ResponseWriter {
+    fn flush(&mut self) -> HandlerResult<()>;
+}
+```
+
+`render_streaming` and `stream_response` accept a `FlushWriter`;
+`StreamingWriter` implements that trait. Each explicit boundary is completed,
+followed by its hydration checkpoint and a semantic flush. At `body_end`, any
+native or scriptless tail HTML is followed by one empty markerless terminal
+record and one final flush. The terminal record never repeats state or template
+metadata. The normal `render` method still accepts any `ResponseWriter` and does
+not progressively hydrate authored boundaries.
+
+The entry template must load its application module with an early
+`<script type="module" async>` in `<head>`, before boundary content. See
+[Progressive Streaming Hydration](/guide/concepts/hydration#progressive-streaming-hydration)
+and the
+[`<boundary>` directive](/guide/concepts/directives/boundary) for the
+authoring and lifecycle contract. That application entry must import
+`@microsoft/webui-framework/streaming.js` before component registration
+modules. The default framework entry does not include the streaming coordinator.
+
+Each checkpoint carries state and templates for the component surface reachable
+from roots rendered since the previous checkpoint, including descendants behind
+initially false conditions or empty repeats. Unrelated later boundaries remain
+excluded. Template metadata is sent only when first reachable, inventory still
+tracks only rendered SSR roots, and repeated instances receive checkpoint-local
+state without duplicate metadata. The final terminal envelope is always
+`[1,nextSequence,3,0,{}]`; its flush also commits preceding static tail bytes.
+
+Host-driven sessions are currently Rust-only. Node and WASM `renderStream`
+callbacks are synchronous whole-render APIs without writable backpressure, and
+the C ABI returns buffered strings. They do not expose this session contract.
+
+The bounded channel limits bytes retained by a running render, but it does not
+bound how many requests can queue in Tokio's blocking pool. Acquire a
+process-wide permit with `try_acquire_owned()` before `spawn_blocking`, return
+HTTP 503 with `Retry-After` when saturated, and move the permit into the closure
+so it is held for the render's full lifetime.
+
+`FlushWriter::flush` means all currently buffered bytes were handed to the HTTP
+transport. It cannot force an HTTP adapter, compressor, reverse proxy, or CDN to
+deliver them immediately. Disable response buffering where applicable and test
+the production delivery path. Checkpoints are strictly in document
+order.
+
 ### Per-request HTML injection
 
-`with_head_inject` / `with_body_inject` splice host-provided HTML at the parser-synthesized `head_end` / `body_end` structural boundaries — zero scan cost, and cannot mis-fire on `</head>` / `</body>` literals appearing inside HTML comments, `<iframe srcdoc>`, or inline `<script>`. Typical uses: per-request `<link rel="preload">` hints, dev livereload script, OpenTelemetry trace IDs.
+`with_head_inject` / `with_body_inject` splice host-provided HTML at the
+parser-synthesized `head_end` / `body_end` structural boundaries. They cannot
+mis-fire on `</head>` / `</body>` literals appearing inside HTML comments,
+`<iframe srcdoc>`, or inline `<script>`. Typical uses include per-request
+`<link rel="preload">` hints, a development livereload script, and OpenTelemetry
+trace IDs.
 
 > **Safety:** the HTML is written verbatim, no escaping. Untrusted input is a direct XSS vector. Pre-escape with `webui_handler::encode_safe` (re-exported for this purpose) if your content path may include user data.
 
 ### Typed streaming errors
 
-`StreamingWriter` returns `HandlerError::ClientDisconnected` (receiver dropped) or `HandlerError::StreamTimeout` (flush deadline exceeded) from both `write()` and `end()`, so callers can distinguish "fully delivered" from "client cancelled" for correct telemetry.
+`StreamingWriter` returns `HandlerError::ClientDisconnected` (receiver dropped)
+or `HandlerError::StreamTimeout` (flush deadline exceeded) from writes,
+boundary flushes, and the final `end()`, so callers can distinguish a completed
+delivery from a cancelled or stalled stream.
 
 ## API Reference
 
@@ -272,6 +381,47 @@ component.
 | `with_nonce(&str)` | builder | CSP nonce reflected onto inline `<script>` tags (including the `<script type="importmap">` tags that register Module-strategy CSS). Empty string normalises to `None`. |
 | `with_head_inject(&str)` | builder | Raw HTML emitted immediately before `</head>` at the parser's structural boundary (see [Streaming SSR](#streaming-ssr)). |
 | `with_body_inject(&str)` | builder | Raw HTML emitted immediately before `</body>`. Same structural-boundary contract. |
+
+### Host-driven streaming
+
+| API | Description |
+|---|---|
+| `WebUIHandler::stream_response(protocol, options, writer)` | Starts one progressive response session |
+| `StreamingResponse::boundary(name)` | Resolves a compiled name once to `BoundaryId` |
+| `StreamingResponse::boundary_count()` | Returns the fixed compile-time boundary count |
+| `StreamingResponse::write_shell(state)` | Renders and flushes the document prefix |
+| `StreamingResponse::write_boundary(id, state, mode)` | Commits the next authored boundary as `Final` or `Updatable` |
+| `StreamingResponse::update(id, state)` | Sends projected object state to a committed updatable boundary |
+| `StreamingResponse::finish(state)` | Renders the tail, emits terminal, and ends the writer |
+
+`StreamingResponse` borrows a `ResponseWriter` for the life of the response,
+which is the cheapest shape when the transport lives in the same process and the
+same language.
+
+When you would rather own the bytes — for example to feed a channel, a test
+harness, or a transport whose writer cannot be borrowed for that long —
+`StreamingSession` offers the same six operations and returns a `Vec<u8>` per
+call instead:
+
+```rust
+let mut session = StreamingSession::new(
+    Arc::clone(&handler),
+    Arc::clone(&protocol),
+    SessionOptions::new("index.html", "/"),
+)?;
+let rows = session.boundary("rows")?;
+
+sink.send(session.write_shell(&shell_state)?)?;
+sink.send(session.write_boundary(rows, &rows_state, BoundaryMode::Final)?)?;
+sink.send(session.finish(&tail_state)?)?;
+```
+
+The session holds its own `Arc` clones, so it may outlive the bindings you
+created it from.
+
+This is the same type Node, WASM, C, and C# drive, so behaviour is identical
+across hosts. Prefer `stream_response` in Rust servers: it writes straight into
+the writer and avoids the per-chunk buffer.
 
 ### HandlerError variants
 

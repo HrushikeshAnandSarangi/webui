@@ -108,6 +108,10 @@
               {
                 "text": "Routes <route>",
                 "link": "/guide/concepts/directives/route"
+              },
+              {
+                "text": "Streaming <boundary>",
+                "link": "/guide/concepts/directives/boundary"
               }
             ]
           },

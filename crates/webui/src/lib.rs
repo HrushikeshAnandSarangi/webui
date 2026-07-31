@@ -22,6 +22,7 @@
 
 mod component_assets;
 mod error;
+mod module_preload;
 mod projection;
 pub mod server;
 pub mod streaming;
@@ -33,7 +34,8 @@ pub use error::WebUIError;
 pub use webui_handler::route_handler::{encode_inventory, get_needed_components, parse_inventory};
 pub use webui_handler::Result as HandlerResult;
 pub use webui_handler::{
-    plugin::HandlerPlugin, HandlerError, Protocol, RenderOptions, ResponseWriter, WebUIHandler,
+    plugin::HandlerPlugin, BoundaryId, BoundaryMode, FlushWriter, HandlerError, Protocol,
+    RenderOptions, ResponseWriter, StreamingResponse, WebUIHandler,
 };
 pub use webui_parser::plugin::{ComponentTemplateArtifact, StateSurface};
 pub use webui_parser::CssStrategy;
@@ -128,6 +130,42 @@ pub fn prepare_projection_manifests(
     let snapshot = projection::load_and_merge(sources)?
         .unwrap_or_else(|| std::sync::Arc::new(projection::ProjectionSnapshot::default()));
     Ok(PreparedProjectionManifests { snapshot })
+}
+
+/// Resolve preload hints for compiler-generated entries using exact output
+/// identities and host-provided served URLs.
+///
+/// This is an internal orchestration hook for hosts such as `webui-press`.
+/// Resolution consumes the manifest's pre-sorted closures and performs no
+/// graph traversal or sorting.
+#[doc(hidden)]
+#[must_use]
+pub fn resolve_generated_module_preloads(
+    projection: &PreparedProjectionManifests,
+    existing_hrefs: &[String],
+    entry_outputs: &[&Path],
+    output_urls: &std::collections::BTreeMap<std::path::PathBuf, String>,
+) -> (Vec<String>, Vec<Diagnostic>) {
+    let mut resolved = module_preload::resolve_exact(
+        &projection.snapshot.entry_closures,
+        existing_hrefs,
+        entry_outputs,
+        output_urls,
+    );
+    (
+        std::mem::take(&mut resolved.hrefs),
+        std::mem::take(&mut resolved.warnings),
+    )
+}
+
+/// Return the exact physical outputs needed to map generated preload URLs.
+#[doc(hidden)]
+#[must_use]
+pub fn generated_module_preload_outputs(
+    projection: &PreparedProjectionManifests,
+    entry_outputs: &[&Path],
+) -> Vec<std::path::PathBuf> {
+    module_preload::exact_output_identities(&projection.snapshot.entry_closures, entry_outputs)
 }
 
 /// Create a pending projection source and its one-shot completer.
@@ -330,6 +368,26 @@ pub struct BuildResult {
     pub stats: BuildStats,
 }
 
+/// Advisory for a streaming entry compiled without a state-projection
+/// manifest.
+///
+/// Cold: constructed at most once per build, and only for streaming entries.
+#[cold]
+#[inline(never)]
+fn streaming_without_projection_warning(entry: &str, boundary_count: usize) -> Diagnostic {
+    let plural = if boundary_count == 1 { "" } else { "s" };
+    Diagnostic::warning(format!(
+        "{entry} declares {boundary_count} streaming boundary checkpoint{plural} \
+         but this build has no state-projection manifest"
+    ))
+    .code(webui_parser::codes::STREAMING_WITHOUT_PROJECTION)
+    .help(
+        "every checkpoint will serialize the whole state object instead of its own \
+         components' keys; pass the client build's `webui-projection.json` through \
+         `BuildOptions::projection_manifests` to send boundary-local state only",
+    )
+}
+
 /// Build a WebUI application from an app directory.
 ///
 /// Parses templates, discovers components, and produces a compiled protocol
@@ -523,6 +581,15 @@ fn build_protocol_inner(options: &BuildOptions) -> Result<RawBuildOutput, WebUIE
             source,
         })?;
 
+    // Read before anything else parses. Both accessors describe the *entry*
+    // template, and every top-level `parse()` starts a fresh namespace, so a
+    // later synthetic parse (asset roots, below) would silently zero them.
+    // They are also copied out because `token_analysis()` borrows the parser
+    // and the parser is consumed before the projection manifest is known.
+    let boundary_count = parser.boundary_count();
+    let boundary_names = parser.boundary_names().to_vec();
+    let module_entry_srcs = parser.module_entry_srcs().to_vec();
+
     let synthetic_asset_fragments =
         parse_component_asset_roots(&mut parser, &options.component_asset_roots)?;
 
@@ -581,11 +648,40 @@ fn build_protocol_inner(options: &BuildOptions) -> Result<RawBuildOutput, WebUIE
     // parser work with an in-flight client bundle through a pending source.
     let merged_manifest = projection::load_and_merge(&options.projection_manifests)?;
     let mut protocol = WebUIProtocol::with_tokens(fragment_records, token_analysis.protocol_tokens);
+    if !boundary_names.is_empty() {
+        protocol.streaming_boundaries.insert(
+            options.entry.clone(),
+            webui_protocol::StreamingBoundaryList {
+                names: boundary_names,
+            },
+        );
+    }
     protocol.initial_state_strategy = if merged_manifest.is_some() {
         webui_protocol::InitialStateStrategy::Components as i32
     } else {
         webui_protocol::InitialStateStrategy::Full as i32
     };
+
+    // Advisory: without a projection manifest every streaming checkpoint falls
+    // back to serializing the entire state object, so the cost is
+    // O(boundaries x full state) rather than O(boundaries x that boundary's
+    // own keys). The build still works, so this is a warning.
+    if boundary_count > 0 && merged_manifest.is_none() {
+        warnings.push(streaming_without_projection_warning(
+            &options.entry,
+            boundary_count,
+        ));
+    }
+
+    // Resolve `modulepreload` hints once, at build time. The shared chunks an
+    // entry statically imports are named only inside that entry's bytes, so
+    // the preload scanner cannot find them; hinting them removes a serialized
+    // round trip. The handler writes the result verbatim.
+    if let Some(merged) = &merged_manifest {
+        let mut preloads = module_preload::resolve(&merged.entry_closures, &module_entry_srcs);
+        protocol.module_preloads = std::mem::take(&mut preloads.hrefs);
+        warnings.append(&mut preloads.warnings);
+    }
 
     // Strict coverage applies only to scripted components that actually made
     // it into the compiled protocol/route closure (i.e. their fragment was
@@ -676,7 +772,7 @@ fn build_protocol_inner(options: &BuildOptions) -> Result<RawBuildOutput, WebUIE
             }
             None => encode_state_surface(&artifact.navigation),
         };
-        component.navigation_mode = navigation_mode;
+        component.navigation_mode = Some(navigation_mode);
         component.navigation_keys = navigation_keys;
     }
 
@@ -868,6 +964,111 @@ mod tests {
         );
     }
 
+    /// Streaming entries pay O(boundaries x full state) without a projection
+    /// manifest, so the build must say so.
+    #[test]
+    fn streaming_entry_without_projection_manifest_warns() {
+        let app = create_app_dir(&[(
+            "index.html",
+            concat!(
+                "<html><body>",
+                r#"<boundary name="a"><p>{{one}}</p></boundary>"#,
+                r#"<boundary name="b"><p>{{two}}</p></boundary>"#,
+                "</body></html>",
+            ),
+        )]);
+        let mut options = default_options(app.path());
+        options.plugin = Some(Plugin::WebUI);
+
+        let result = build(options).unwrap();
+
+        assert_eq!(
+            result.protocol.initial_state_strategy,
+            webui_protocol::InitialStateStrategy::Full as i32
+        );
+        assert_eq!(
+            result.protocol.streaming_boundaries["index.html"].names,
+            ["a", "b"]
+        );
+        let decoded = WebUIProtocol::from_protobuf(&result.protocol_bytes).unwrap();
+        assert_eq!(decoded.streaming_boundaries["index.html"].names, ["a", "b"]);
+        let warning = result
+            .warnings
+            .iter()
+            .find(|diag| {
+                diag.error_code() == Some(webui_parser::codes::STREAMING_WITHOUT_PROJECTION)
+            })
+            .expect("a streaming build without projection must warn");
+        assert_eq!(warning.severity(), webui_parser::Severity::Warning);
+        assert!(
+            warning.to_string().contains("2 streaming boundary"),
+            "warning should report the boundary count: {warning}"
+        );
+        assert!(
+            warning
+                .help_text()
+                .is_some_and(|help| help.contains("projection_manifests")),
+            "warning should point at the fix: {warning}"
+        );
+    }
+
+    #[test]
+    fn streaming_entry_with_projection_manifest_does_not_warn() {
+        let app = create_app_dir(&[(
+            "index.html",
+            concat!(
+                "<html><body>",
+                r#"<boundary name="a"><p>{{one}}</p></boundary>"#,
+                "</body></html>",
+            ),
+        )]);
+        let manifest_json =
+            projection::test_support::build_valid_manifest_json(app.path(), &[], &[], &[]);
+        let manifest = projection::test_support::write_manifest(
+            app.path(),
+            "webui-projection.json",
+            &manifest_json,
+        );
+        let mut options = default_options(app.path());
+        options.plugin = Some(Plugin::WebUI);
+        options.projection_manifests = vec![manifest.into()];
+
+        let result = build(options).unwrap();
+
+        assert_eq!(
+            result.protocol.initial_state_strategy,
+            webui_protocol::InitialStateStrategy::Components as i32
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|diag| diag.error_code()
+                    == Some(webui_parser::codes::STREAMING_WITHOUT_PROJECTION)),
+            "a projected streaming build must not warn"
+        );
+    }
+
+    /// The advisory is streaming-specific: ordinary entries emit one bootstrap
+    /// block, so full state there is not a per-checkpoint multiplier.
+    #[test]
+    fn non_streaming_entry_without_projection_manifest_does_not_warn() {
+        let app = create_app_dir(&[("index.html", "<html><body><p>{{one}}</p></body></html>")]);
+        let mut options = default_options(app.path());
+        options.plugin = Some(Plugin::WebUI);
+
+        let result = build(options).unwrap();
+
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|diag| diag.error_code()
+                    == Some(webui_parser::codes::STREAMING_WITHOUT_PROJECTION)),
+            "a non-streaming build must not warn about projection"
+        );
+    }
+
     #[test]
     fn test_build_keeps_scriptless_component_dormant_until_client_use() {
         let app = create_app_dir(&[
@@ -1007,7 +1208,7 @@ mod tests {
         assert_eq!(component.hydration_keys, vec!["count", "ctaHref", "name"]);
         assert_eq!(
             component.navigation_mode,
-            webui_protocol::StateProjectionMode::Keys as i32
+            Some(webui_protocol::StateProjectionMode::Keys as i32)
         );
         assert_eq!(component.navigation_keys, vec!["count", "ctaHref", "name"]);
     }
@@ -1047,7 +1248,7 @@ mod tests {
         assert!(component.hydration_keys.is_empty());
         assert_eq!(
             component.navigation_mode,
-            webui_protocol::StateProjectionMode::All as i32
+            Some(webui_protocol::StateProjectionMode::All as i32)
         );
 
         let handler = WebUIHandler::with_plugin(|| Box::new(WebUIHydrationPlugin::new()));

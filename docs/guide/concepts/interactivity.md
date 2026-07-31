@@ -239,8 +239,9 @@ Event handlers use method-call syntax only. Arguments can be:
 General JavaScript expressions and nested function calls are not parsed in
 templates. Compute those values in the component class or pass a supported path.
 
-Invalid handler syntax — a general expression such as `@click="e.preventDefault()"`,
-or a bare name like `@click="{closeMenu}"` — fails the build with an actionable
+Invalid handler syntax, such as a general expression like
+`@click="e.preventDefault()"` or a bare name like `@click="{closeMenu}"`, fails
+the build with an actionable
 error that names the offending component and element.
 
 ### DOM References
@@ -260,7 +261,7 @@ focusInput(): void {
 }
 ```
 
-`w-ref` must use braces to bind to a component property — `w-ref="{inputEl}"`
+`w-ref` must use braces to bind to a component property: `w-ref="{inputEl}"`
 (or the unquoted `w-ref={inputEl}`), never `w-ref="inputEl"`. The build fails
 with an actionable error otherwise.
 
@@ -563,7 +564,12 @@ From this point on, interactions are handled entirely on the client. Changes to 
 
 ### Setting observable state during setup
 
-The server owns the first paint, and the framework **trusts** the HTML it produced — hydration wires bindings to the existing DOM instead of re-rendering it. A value you write *before hydration finishes* — in an `@observable` field initializer, the `constructor`, or before you call `super.connectedCallback()` — updates the property's backing field but cannot touch the DOM yet, so it is dropped. Your element's state then silently disagrees with what is on screen.
+The server owns the first paint, and the framework **trusts** the HTML it
+produced. Hydration wires bindings to the existing DOM instead of re-rendering
+it. A value you write *before hydration finishes*, in an `@observable` field
+initializer, the `constructor`, or before you call `super.connectedCallback()`,
+updates the property's backing field but cannot touch the DOM yet, so it is
+dropped. Your element's state then silently disagrees with what is on screen.
 
 When the framework detects this it logs a development warning naming the properties, so the mismatch is never silent:
 
@@ -572,17 +578,27 @@ When the framework detects this it logs a development warning naming the propert
 super.connectedCallback() to a value that differs from the server-rendered DOM…
 ```
 
-Follow one rule to stay correct:
+Follow these rules to stay correct:
 
 - **A value that must appear in the first render belongs in the SSR state.** Provide it in the JSON state so the server renders it; the client then hydrates against a matching DOM.
-- **Assign anything else after `super.connectedCallback()`**, where `@observable` writes flow through live bindings.
+- **Assign post-hydration state from `hydratedCallback()`**, where
+  `@observable` writes flow through live bindings on ordinary, streamed, and
+  client-created components.
 
-WebUI treats `super.connectedCallback()` as a synchronous hydration boundary.
-When it returns, that component's bindings, events, and `w-ref` references are
-wired. This relies on the WebUI loading contract: load authored component code
-with a parser-inserted, non-async ES module script or a classic `defer` script.
-If a classic script blocks parsing, place it after every SSR instance it may
-upgrade.
+On a normal buffered page or client-created mount,
+`super.connectedCallback()` hydrates synchronously. A progressive streaming host
+can connect while its `data-ws` boundary is incomplete, however, so the same call
+returns while hydration is still deferred. `hydratedCallback()` is the
+cross-mode lifecycle: WebUI invokes it synchronously exactly once after the
+first successful hydration or mount. Its once-latch is set before author code,
+so reconnecting the element or throwing from the callback does not retry it.
+
+Buffered pages rely on loading authored component code with a parser-inserted,
+non-async ES module script or a classic `defer` script. If a classic script
+blocks parsing, place it after every SSR instance it may upgrade. An opt-in
+[progressive streaming page](/guide/concepts/hydration#progressive-streaming-hydration)
+instead loads an early async module and gates each component until its complete
+streaming boundary commits.
 
 Descendants must not structurally mutate a containing WebUI component's SSR
 subtree before that component hydrates. Inserting, removing, or reordering nodes
@@ -592,13 +608,14 @@ can shift compiled paths before WebUI wires them.
 export class MyCounter extends WebUIElement {
   @observable count = 0;
 
-  connectedCallback(): void {
-    // ✗ Wrong: runs before hydration — dropped, and warns.
+  constructor() {
+    super();
+    // ✗ Wrong: this runs before hydration, so the write is dropped and warns.
     // this.count = 3;
+  }
 
-    super.connectedCallback();
-
-    // ✓ Correct: runs after hydration — updates the DOM reactively.
+  protected override hydratedCallback(): void {
+    // ✓ Correct: this hook runs after hydration in every mode.
     this.count = 3;
   }
 }

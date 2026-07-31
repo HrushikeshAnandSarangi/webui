@@ -610,6 +610,7 @@ MyComponent.define('my-component');
 | `this.$emit(name, detail?)` | Dispatch a bubbling CustomEvent |
 | `this.$update()` | Force a reactive update cycle |
 | `this.$flushUpdates()` | Synchronously flush pending updates |
+| `protected hydratedCallback()` | Run synchronously once after the first successful hydration or client mount |
 | `static define(tagName)` | Register as a custom element |
 | `defineComponentAssets(manifest)` | Lazy component assets with `preload(tag)` / `create(tag)` |
 
@@ -643,23 +644,94 @@ import './user-card/user-card.js';
 Importing a component module registers it as a custom element, which triggers
 hydration. Nothing else is required.
 
-### The `super.connectedCallback()` boundary
+### The hydration boundary
 
-Never write `@observable` values before `super.connectedCallback()`. During SSR
-hydration the server-rendered DOM is trusted and not re-rendered, so a value set
-in a field initializer, the constructor, or before that call cannot reach the
-DOM. The write is dropped and the runtime logs a `[WebUI] Hydration mismatch`
-warning (development-only; stripped from production via `__WEBUI_DEV__`).
+Never write `@observable` values before hydration. During SSR hydration the
+server-rendered DOM is trusted and not re-rendered, so a value set in a field
+initializer, the constructor, or before `super.connectedCallback()` cannot
+reach the DOM. The write is dropped and the runtime logs a `[WebUI] Hydration
+mismatch` warning (development-only; stripped from production via
+`__WEBUI_DEV__`).
 
 If the value must appear in the first render, put it in the SSR state JSON.
-Otherwise assign it after `super.connectedCallback()`, which is a synchronous
-hydration boundary: when it returns, the component's bindings, events, and
-`w-ref` references are wired.
+Otherwise assign it in `hydratedCallback()`. On buffered SSR and client-created
+mounts, `super.connectedCallback()` hydrates synchronously, but streamed hosts
+can return while still deferred. `hydratedCallback()` is the cross-mode signal:
+it runs synchronously exactly once after the first successful hydration or
+mount, and reconnects or callback exceptions do not retry it.
 
-Load definitions through a parser-inserted, non-async ES module script or a
-classic `defer` script. Descendants must not structurally mutate a containing
-WebUI component's SSR subtree before it hydrates - insertion, removal, or
-reordering shifts compiled paths.
+Load buffered definitions through a parser-inserted, non-async ES module script
+or a classic `defer` script. Descendants must not structurally mutate a
+containing WebUI component's SSR subtree before it hydrates - insertion,
+removal, or reordering shifts compiled paths.
+
+### Progressive streaming hydration
+
+Use `<boundary>` only when the Rust server calls
+`WebUIHandler::render_streaming` / `WebUIHandler::stream_response` with a
+`FlushWriter`, or when an API backend returns the versioned
+`application/x-webui-stream` control format to `webui serve --api-port`. The
+directive is removed at compile time and emits no application DOM wrapper.
+
+```html
+<head>
+  <script type="module" async src="/index.js"></script>
+</head>
+<body>
+  <boundary name="weather-shell">
+    <weather-panel status="loading"></weather-panel>
+  </boundary>
+
+  <boundary name="critical-composer">
+    <message-composer></message-composer>
+  </boundary>
+</body>
+```
+
+- `name` is required, non-empty, static, and unique in the entry template. It
+  cannot contain a <code v-pre>{{binding}}</code>.
+- Author boundaries only in the outermost entry template. They cannot appear
+  inside reusable components, route-shell components, `<if>`, `<for>`,
+  `<route>`, or another boundary. An entry-level boundary can fully wrap those
+  complete scopes.
+- Every registered WebUI component rendered in streaming mode must be inside
+  an explicit boundary. Native HTML and unregistered static tail markup may
+  remain outside.
+- Never author `<webui-hydrate>`. It is reserved generated runtime output.
+- Put the async application module in `<head>` before boundary content and
+  import `@microsoft/webui-framework/streaming.js` before component
+  registration modules.
+- Boundary HTML commits strictly in document order. For slow backend state,
+  commit a complete component shell as `BoundaryMode::Updatable`, then call
+  `StreamingResponse::update` when data resolves. Updates interleave on the
+  original response and call `setState()` without rerunning hydration or
+  `hydratedCallback()`.
+- Resolve free-form names once with `StreamingResponse::boundary`; hot writes
+  use integer `BoundaryId` handles. Call `write_shell`, ordered
+  `write_boundary`, interleavable `update`, then `finish`.
+- `webui:boundary-hydrated` is emitted only when
+  `window.__WEBUI_STREAMING_DEBUG__ === true`; its `detail.kind` is
+  `checkpoint`, `update`, or `terminal`. Every commit also emits an
+  unconditional `performance.mark()` (`webui:boundary:<id>`,
+  `webui:boundary:<id>:update`, `webui:streaming:terminal`) that tooling can
+  read retroactively without a listener.
+  `webui:hydration-complete` fires only after the terminal record and all
+  pending hydration work complete.
+- `window.__WEBUI_STREAMING_SLICE_MS__` opts into a time-sliced drain that
+  yields between boundaries. Use it only when an intermediary coalesces the
+  response into one chunk; it costs total hydration time.
+- A semantic flush hands bytes to the HTTP transport. Server adapters,
+  compression, proxies, and CDNs can still buffer them.
+
+Malformed directives use stable diagnostics:
+`missing-boundary-name`, `invalid-boundary-name`,
+`duplicate-boundary-name`, `nested-boundary`, `boundary-crosses-scope`, and
+`authored-webui-hydrate`.
+
+Dynamic append streams, out-of-order replacement, router-stream reuse, direct
+Node/FFI/WASM response sessions, and declarative partial updates are not part of
+this contract. Node can drive the CLI bridge, but the CLI remains the Rust
+session and transport owner.
 
 ### Lazy component mounting
 
@@ -1019,6 +1091,32 @@ handler.render(&protocol, &state, &options, &mut writer)?;
 const protocol = new Protocol(result.protocol, { plugin: 'webui' });
 const html = protocol.render(state, { entry: 'index.html', requestPath: req.url });
 ```
+
+For Rust progressive hydration, create a `StreamingResponse` over a
+`FlushWriter`. Keep one bounded worker as the response owner, cap admitted
+renders before spawning it, and configure the transport's flush timeout.
+
+```rust
+let mut page = handler.stream_response(&protocol, &options, &mut writer)?;
+let critical = page.boundary("critical-composer")?;
+page.write_shell(&state)?;
+page.write_boundary(critical, &state, BoundaryMode::Final)?;
+page.finish(&state)?;
+```
+
+With `webui serve --api-port`, a Node or other HTTP backend can return
+newline-delimited control records instead:
+
+```text
+{"type":"shell","version":1,"state":{...}}
+{"type":"boundary","name":"critical-composer"}
+{"type":"finish"}
+```
+
+Honor HTTP write backpressure and cap concurrent streams. The CLI uses a
+capacity-one command channel, resolves boundary names once, and keeps the
+compiled protocol plus browser-facing bytes in Rust. Returning JSON keeps the
+buffered state path.
 
 Equivalent APIs exist for WebAssembly, Python (FFI), Go (cgo), and C#. For
 `Router.ensureLoaded()`, expose `GET /_webui/templates?t=tag1,tag2` backed by

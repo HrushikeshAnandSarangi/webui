@@ -1818,6 +1818,7 @@ dependencies = [
  "console",
  "expand-tilde",
  "log",
+ "memchr",
  "microsoft-webui",
  "microsoft-webui-dev-server",
  "microsoft-webui-discovery",
@@ -1825,8 +1826,10 @@ dependencies = [
  "microsoft-webui-protocol",
  "microsoft-webui-tokens",
  "mime_guess",
+ "serde",
  "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-stream",
 ]
@@ -1890,6 +1893,7 @@ version = "0.0.19"
 dependencies = [
  "criterion",
  "microsoft-webui-expressions",
+ "microsoft-webui-parser",
  "microsoft-webui-protocol",
  "microsoft-webui-state",
  "microsoft-webui-test-utils",

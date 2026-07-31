@@ -54,9 +54,11 @@ pub struct ComponentData {
     /// How initial hydration state is selected for this component.
     #[prost(enumeration = "StateProjectionMode", tag = "8")]
     pub hydration_mode: i32,
-    /// How partial-navigation state is selected for this component.
-    #[prost(enumeration = "StateProjectionMode", tag = "9")]
-    pub navigation_mode: i32,
+    /// How partial-navigation state is selected for this component. Presence is
+    /// significant: protocols produced before projection metadata leave this
+    /// absent, so handlers preserve full state instead of treating it as NONE.
+    #[prost(enumeration = "StateProjectionMode", optional, tag = "9")]
+    pub navigation_mode: ::core::option::Option<i32>,
 }
 /// Root protocol containing all fragment records and build metadata.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -90,6 +92,35 @@ pub struct WebUiProtocol {
     /// projection. Partial-navigation state remains component-driven.
     #[prost(enumeration = "InitialStateStrategy", tag = "6")]
     pub initial_state_strategy: i32,
+    /// Ready-to-write `<link rel="modulepreload">` hrefs for the shared chunks
+    /// that the page's critical module entries statically import, in the exact
+    /// order they must be emitted (largest chunk first).
+    ///
+    /// These chunks are named only inside the entry's own bytes, so the browser's
+    /// preload scanner cannot discover them until it has downloaded and parsed
+    /// the entry. Emitting them as hints removes that serialization.
+    ///
+    /// Order is load-bearing: preloads are issued in document order over one
+    /// connection, so a small chunk ahead of a large one delays the long pole.
+    /// The compiler resolves and sorts these at build time so the handler writes
+    /// them verbatim with no per-request work.
+    #[prost(string, repeated, tag = "7")]
+    pub module_preloads: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Free-form <boundary name> values keyed by entry fragment and stored in
+    /// declaration order. Hosts resolve a name once to its zero-based BoundaryId;
+    /// names never reach the rendered HTML response.
+    #[prost(map = "string, message", tag = "8")]
+    pub streaming_boundaries: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        StreamingBoundaryList,
+    >,
+}
+/// Ordered compile-time boundary names for one entry fragment.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StreamingBoundaryList {
+    #[prost(string, repeated, tag = "1")]
+    pub names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// A list of fragments (needed because protobuf maps cannot have repeated values directly).
 #[derive(serde::Serialize, serde::Deserialize)]

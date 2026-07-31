@@ -35,6 +35,7 @@ import {
 } from "../diagnostics.js";
 import type { ProjectionDiagnostic } from "../diagnostics.js";
 import {
+  compareUtf8,
   serializeManifestCanonical,
 } from "../manifest.js";
 import {
@@ -168,6 +169,11 @@ async function emitProjectionManifest(
     graph,
     membership,
     outputContents,
+    entryClosures: buildEntryClosures(
+      metafile,
+      outputIds,
+      build.initialOptions.publicPath
+    ),
     rootDir,
     manifestPath,
     bundlerName: "esbuild",
@@ -239,6 +245,20 @@ async function loadInputRecords(
   const entries = Object.keys(metafile.inputs);
   const records = await Promise.all(
     entries.map(async (metafileId) => {
+      const stdinSource = sourceForStdin(
+        metafileId,
+        build
+      );
+      if (stdinSource !== undefined) {
+        return {
+          metafileId,
+          moduleId: virtualModuleId(metafileId),
+          kind: "virtual" as const,
+          source: stdinSource,
+          packageName: undefined,
+        };
+      }
+
       const filePath = path.resolve(workingDirectory, metafileId);
       const source = await readPhysicalSource(filePath);
       if (source !== undefined) {
@@ -251,15 +271,11 @@ async function loadInputRecords(
         };
       }
 
-      const stdinSource = sourceForStdin(
-        metafileId,
-        build
-      );
       return {
         metafileId,
         moduleId: virtualModuleId(metafileId),
         kind: "virtual" as const,
-        source: stdinSource,
+        source: undefined,
         packageName: undefined,
       };
     })
@@ -385,6 +401,74 @@ function buildMembership(
     outputs.set(outputId, members);
   }
   return { outputs };
+}
+
+/**
+ * Computes each entry output's transitive static import closure, largest-first.
+ *
+ * A browser that fetches an entry module must also fetch every chunk the entry
+ * reaches through static `import` statements before it can execute, and those
+ * chunks are invisible to the preload scanner because they are named only
+ * inside the entry's own bytes. Recording the closure here lets the handler
+ * emit `modulepreload` hints without a second bundler pass.
+ *
+ * Ordering is the point, not a detail: preloads are issued in document order
+ * over a shared connection, so a small chunk listed ahead of a large one
+ * delays the long pole. Only esbuild knows the byte counts, so it sorts.
+ */
+function buildEntryClosures(
+  metafile: Metafile,
+  outputIds: ReadonlyMap<string, string>,
+  publicPath: string | undefined
+): ReadonlyMap<string, ReadonlyArray<string>> {
+  const closures = new Map<string, ReadonlyArray<string>>();
+  for (const [outputPath, metadata] of Object.entries(metafile.outputs)) {
+    if (metadata.entryPoint === undefined) continue;
+    const entryId = outputIds.get(outputPath);
+    if (!entryId) continue;
+    if (publicPath) {
+      // A public path changes the URL written into emitted import specifiers,
+      // but the metafile still exposes local output paths. Until the manifest
+      // carries served URLs, retaining an empty owner is safer than synthesizing
+      // same-origin hrefs for potentially cross-origin chunks.
+      closures.set(entryId, []);
+      continue;
+    }
+
+    // Iterative worklist: an output import graph may contain cycles, and the
+    // repo bans recursion in graph walks.
+    const reached = new Set<string>([outputPath]);
+    const pending = [outputPath];
+    const members: string[] = [];
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      const imports = metafile.outputs[current]?.imports;
+      if (!imports) continue;
+      for (const edge of imports) {
+        if (edge.kind !== "import-statement" || edge.external === true) {
+          continue;
+        }
+        if (reached.has(edge.path)) continue;
+        reached.add(edge.path);
+        pending.push(edge.path);
+        members.push(edge.path);
+      }
+    }
+    members.sort((left, right) => {
+      const bySize =
+        (metafile.outputs[right]?.bytes ?? 0) -
+        (metafile.outputs[left]?.bytes ?? 0);
+      return bySize !== 0 ? bySize : compareUtf8(left, right);
+    });
+
+    const resolved: string[] = [];
+    for (const member of members) {
+      const memberId = outputIds.get(member);
+      if (memberId) resolved.push(memberId);
+    }
+    closures.set(entryId, resolved);
+  }
+  return closures;
 }
 
 async function loadOutputContents(

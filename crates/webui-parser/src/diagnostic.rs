@@ -102,6 +102,50 @@ pub mod codes {
     /// A CSS token used only with a literal `var()` fallback and absent from
     /// every theme — non-fatal, but usually a typo. Severity: warning.
     pub const UNTHEMED_TOKEN: &str = "unthemed-token";
+    /// `<boundary>` is missing its required, non-empty `name` attribute.
+    pub const MISSING_BOUNDARY_NAME: &str = "missing-boundary-name";
+    /// `<boundary name>` is not a static string literal (e.g. it
+    /// contains a `{{binding}}`).
+    pub const INVALID_BOUNDARY_NAME: &str = "invalid-boundary-name";
+    /// Two `<boundary>` directives in the same entry template share a
+    /// `name`.
+    pub const DUPLICATE_BOUNDARY_NAME: &str = "duplicate-boundary-name";
+    /// A `<boundary>` is nested inside another `<boundary>`.
+    pub const NESTED_BOUNDARY: &str = "nested-boundary";
+    /// A `<boundary>` would cut through component host content, a reusable
+    /// component template, an inert/raw-text HTML element, `<if>`, `<for>`, or
+    /// `<route>` instead of independently wrapping it.
+    pub const BOUNDARY_CROSSES_SCOPE: &str = "boundary-crosses-scope";
+    /// A `<boundary>` appears before `<body>` opens or after it closes.
+    pub const BOUNDARY_OUTSIDE_BODY: &str = "boundary-outside-body";
+    /// A `<boundary>` appears inside an HTML insertion mode that
+    /// foster-parents unknown elements (`<table>`, `<tbody>`, `<tr>`,
+    /// `<select>`, …), which would separate the generated `<webui-hydrate>`
+    /// sentinel from its payload script.
+    pub const BOUNDARY_IN_FOSTER_CONTEXT: &str = "boundary-in-foster-context";
+    /// `<webui-hydrate>` was written by an application author. It is reserved
+    /// for the compiler/handler-generated runtime hydration sentinel.
+    pub const AUTHORED_WEBUI_HYDRATE: &str = "authored-webui-hydrate";
+    /// An entry declares `<boundary>` streaming checkpoints but the
+    /// build has no state-projection manifest, so every checkpoint serializes
+    /// the whole state object instead of its own components' keys.
+    /// Severity: warning.
+    pub const STREAMING_WITHOUT_PROJECTION: &str = "streaming-without-projection";
+    /// More than one build output shares the file name of an authored
+    /// `<script type="module" src>`, so its shared chunks cannot be preloaded
+    /// without guessing which output the URL serves.
+    /// Severity: warning.
+    pub const AMBIGUOUS_MODULE_ENTRY: &str = "ambiguous-module-entry";
+    /// A module entry's static import closure exceeded the `modulepreload`
+    /// hint cap. Preloads share one connection, so the remainder would delay
+    /// the entry they are meant to accelerate.
+    /// Severity: warning.
+    pub const EXCESSIVE_MODULE_PRELOADS: &str = "excessive-module-preloads";
+    /// A resolved `modulepreload` href contains characters that cannot be
+    /// written verbatim into an HTML attribute, so the hint was dropped rather
+    /// than emitted or escaped.
+    /// Severity: warning.
+    pub const UNSAFE_MODULE_PRELOAD: &str = "unsafe-module-preload";
 }
 
 /// A build-time template-authoring diagnostic.

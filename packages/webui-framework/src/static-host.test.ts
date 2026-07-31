@@ -78,6 +78,7 @@ Object.defineProperty(globalThis, 'window', {
 });
 
 const { installTemplateElementRuntime } = await import('./static-host.js');
+const { deferTemplateDefinition } = await import('./template.js');
 
 function registerTemplate(tag: string, meta: TemplateMeta): TemplateMeta {
   const webui = window.__webui ?? (window.__webui = {});
@@ -103,10 +104,16 @@ describe('dormant template host runtime', () => {
     const instance = new ctor() as HTMLElement & {
       $shouldDeferSSRHydration(): boolean;
       $shouldApplySSRBootstrapState(): boolean;
+      $shouldActivateOnBoundaryCommit(): boolean;
       setState(state: Record<string, unknown>): void;
     };
     assert.equal(instance.$shouldDeferSSRHydration(), true);
     assert.equal(instance.$shouldApplySSRBootstrapState(), false);
+    assert.equal(
+      instance.$shouldActivateOnBoundaryCommit(),
+      false,
+      'a compiler-owned host must stay dormant on a streaming boundary commit; only a client state write wakes it',
+    );
     assert.equal(typeof instance.setState, 'function');
   });
 
@@ -143,6 +150,19 @@ describe('dormant template host runtime', () => {
     }));
 
     assert.ok(customElements.get(tag));
+  });
+
+  test('router-style registration defines a pending authored class before a static host can claim it', () => {
+    const tag = `router-authored-unit-${Date.now()}`;
+    const authored = class AuthoredRouteElement extends HTMLElement {};
+    const meta = registerTemplate(tag, { h: '<p></p>', th: 1 });
+    deferTemplateDefinition(tag, authored, () => customElements.define(tag, authored));
+
+    window.dispatchEvent(new CustomEvent('webui:templates-registered', {
+      detail: { templates: { [tag]: meta } },
+    }));
+
+    assert.equal(customElements.get(tag), authored);
   });
 
   test('does not claim tags reserved for authored lazy loaders', () => {
