@@ -21,6 +21,7 @@ import type { AddressInfo } from 'node:net';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { analyzeMetafile, type Metafile } from 'esbuild';
 
 let appDir: string;
 
@@ -101,16 +102,21 @@ describe('build', () => {
     assert.equal(result.stats.cssFileCount, 1);
   });
 
-  test('emits static component asset files', () => {
+  test('emits static component asset files and an analyzable metafile', async () => {
     const result = build({
       appDir,
       entry: 'index3.html',
       plugin: 'webui',
       componentAssetRoots: ['lazy-panel'],
+      metafile: true,
     });
     assert.equal(result.componentAssetFiles.length, 2); // [filename, content]
     assert.equal(result.componentAssetFiles[0], 'lazy-panel.webui.js');
     assert.match(result.componentAssetFiles[1], /webui-component-asset/);
+    assert.ok(result.metafile);
+    const parsedMetafile: Metafile = JSON.parse(result.metafile);
+    const analysis = await analyzeMetafile(parsedMetafile);
+    assert.match(analysis, /lazy-panel\.webui\.js/);
   });
 
   test('throws on missing appDir', () => {

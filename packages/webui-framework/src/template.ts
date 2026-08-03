@@ -50,8 +50,8 @@ import {
 } from './template-events.js';
 
 import type {
+  CompiledCondition,
   CompiledConditionFn,
-  SerializedCompiledCondition,
   TemplateBlockMeta,
   TemplateCondition,
   TemplateMeta,
@@ -59,6 +59,7 @@ import type {
 
 const WEBUI_DATA_ID = 'webui-data';
 const normalizedTemplates = new WeakSet<TemplateMeta>();
+const assetNormalizedTemplates = new WeakSet<TemplateMeta>();
 let webuiDataLoaded = false;
 
 interface PendingTemplateDefinition {
@@ -73,6 +74,7 @@ function acceptTemplateData(
   templates: Record<string, TemplateMeta>,
   templateFns?: Record<string, CompiledConditionFn[]>,
 ): boolean {
+  prepareTemplateData(templates, templateFns);
   const w = window as Window;
   if (!w.__webui) w.__webui = {};
   if (!w.__webui.templates) w.__webui.templates = {};
@@ -87,9 +89,7 @@ function acceptTemplateData(
   const names = Object.keys(templates);
   for (let i = 0; i < names.length; i++) {
     const tag = names[i];
-    const meta = templates[tag];
-    w.__webui.templates[tag] = meta;
-    normalizeTemplate(tag, meta);
+    w.__webui.templates[tag] = templates[tag];
   }
   for (let i = 0; i < names.length; i++) {
     const pending = pendingTemplateDefinitions.get(names[i]);
@@ -157,6 +157,38 @@ export function registerTemplateData(
   }
 }
 
+function prepareTemplateData(
+  templates: Record<string, TemplateMeta>,
+  templateFns?: Record<string, CompiledConditionFn[]>,
+): void {
+  const names = Object.keys(templates);
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    normalizeTemplate(name, templates[name], templateFns?.[name]);
+  }
+}
+
+/**
+ * Resolve compiler-emitted component asset conditions against asset-local closures.
+ *
+ * Unlike streamed and SSR registration, asset normalization never falls back
+ * to closures already present in the page-wide registry.
+ */
+export function prepareAssetTemplateData(
+  templates: Record<string, TemplateMeta>,
+  templateFns?: Record<string, CompiledConditionFn[]>,
+): void {
+  const names = Object.keys(templates);
+  for (let i = 0; i < names.length; i++) {
+    const name = names[i];
+    const meta = templates[name];
+    if (assetNormalizedTemplates.has(meta)) continue;
+    normalizeTemplateConditions(name, meta, templateFns?.[name] ?? []);
+    normalizedTemplates.add(meta);
+    assetNormalizedTemplates.add(meta);
+  }
+}
+
 /**
  * Hold an authored custom-element definition until streamed metadata arrives.
  *
@@ -197,9 +229,22 @@ function loadWebUIDataBlock(): void {
   webuiDataLoaded = true;
 }
 
-function normalizeTemplate(name: string, meta: TemplateMeta): void {
+function normalizeTemplate(
+  name: string,
+  meta: TemplateMeta,
+  suppliedFns?: CompiledConditionFn[],
+): void {
   if (normalizedTemplates.has(meta)) return;
-  const fns = window.__webui?.templateFns?.[name] ?? [];
+  const fns = suppliedFns ?? window.__webui?.templateFns?.[name] ?? [];
+  normalizeTemplateConditions(name, meta, fns);
+  normalizedTemplates.add(meta);
+}
+
+function normalizeTemplateConditions(
+  name: string,
+  meta: TemplateMeta,
+  fns: CompiledConditionFn[],
+): void {
   const stack: TemplateBlockMeta[] = [meta];
   while (stack.length > 0) {
     const block = stack.pop();
@@ -220,7 +265,6 @@ function normalizeTemplate(name: string, meta: TemplateMeta): void {
       for (let i = 0; i < children.length; i++) stack.push(children[i]);
     }
   }
-  normalizedTemplates.add(meta);
 }
 
 function normalizeCondition(
@@ -234,5 +278,5 @@ function normalizeCondition(
   if (typeof fn !== 'function') {
     throw new Error(`[WebUI] Missing condition closure ${first} for <${tagName}>.`);
   }
-  (condition as SerializedCompiledCondition as unknown as [CompiledConditionFn, string[]])[0] = fn;
+  (condition as CompiledCondition)[0] = fn;
 }

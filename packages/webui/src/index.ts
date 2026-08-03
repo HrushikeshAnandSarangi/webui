@@ -2,10 +2,7 @@
 // Licensed under the MIT license.
 
 import { createRequire } from "node:module";
-import { execFileSync } from "node:child_process";
-import fs from "node:fs";
-import nodePath from "node:path";
-import { resolve, platformKey } from "./platform.js";
+import { packageName, platformKey, resolve } from "./platform.js";
 
 const require = createRequire(import.meta.url);
 
@@ -25,12 +22,12 @@ export interface BuildOptions {
   components?: string[];
   /** Root component tags emitted as static `.webui.js` ESM assets. */
   componentAssetRoots?: string[];
+  /** Generate and return an esbuild-compatible component asset metafile. */
+  metafile?: boolean;
   /** Emitted asset filename template for Link-mode CSS and component assets. Tokens: [name], [hash], [ext]. */
   cssFileNameTemplate?: string;
   /** Optional base URL/path prefix for Link-mode CSS hrefs. */
   cssPublicBase?: string;
-  /** Output directory (used by CLI fallback for build-to-disk). */
-  outDir?: string;
   /** Design token theme: a JSON file path or npm package name. */
   theme?: string;
   /** Projection manifest file paths, merged in order. */
@@ -66,6 +63,8 @@ export interface BuildResult {
   cssFiles: string[];
   /** Static component asset files as alternating [filename, content, ...]. */
   componentAssetFiles: string[];
+  /** Esbuild-compatible component asset metafile JSON when requested. */
+  metafile?: string;
   /** Non-fatal build advisories as plain diagnostic strings. */
   warnings: string[];
   /** Build statistics. */
@@ -153,6 +152,7 @@ interface NativeAddon {
     plugin?: string;
     components?: string[];
     componentAssetRoots?: string[];
+    metafile?: boolean;
     cssFileNameTemplate?: string;
     cssPublicBase?: string;
     projectionManifests?: string[];
@@ -196,39 +196,44 @@ interface NativeStreamingSession {
   finish(stateJson: string): Buffer;
 }
 
-let addon: NativeAddon | null = null;
-let fallbackWarned = false;
+let addon: NativeAddon | undefined;
 
-function loadAddon(): NativeAddon | null {
+function loadAddon(): NativeAddon {
   if (addon) return addon;
 
   const addonPath = resolve("addon");
-  if (addonPath) {
-    try {
-      // .node files load via require(), native libs (.dylib/.so/.dll) via dlopen
-      if (addonPath.endsWith(".node")) {
-        addon = require(addonPath) as NativeAddon;
-      } else {
-        const m: { exports: NativeAddon } = { exports: {} as NativeAddon };
-        process.dlopen(m, addonPath);
-        addon = m.exports;
-      }
-      return addon;
-    } catch {
-      // Fall through to WASM.
-    }
+  if (!addonPath) {
+    throw new Error(
+      `[webui] Native addon not found for ${platformKey()}. ${addonInstallHelp()} ` +
+        'The Node API does not fall back to the CLI; invoke "webui" explicitly for filesystem builds.',
+    );
   }
-  return null;
+
+  try {
+    // .node files load via require(), native libs (.dylib/.so/.dll) via dlopen
+    if (addonPath.endsWith(".node")) {
+      addon = require(addonPath) as NativeAddon;
+    } else {
+      const m: { exports: NativeAddon } = { exports: {} as NativeAddon };
+      process.dlopen(m, addonPath);
+      addon = m.exports;
+    }
+  } catch (cause) {
+    throw new Error(
+      `[webui] Failed to load native addon at ${addonPath}. ${addonInstallHelp()}`,
+      { cause },
+    );
+  }
+  return addon;
 }
 
-function warnFallback(): void {
-  if (fallbackWarned) return;
-  fallbackWarned = true;
-  console.warn(
-    `[webui] Native addon not available for ${platformKey()}. ` +
-      `Using WASM fallback — performance may be degraded.\n` +
-      `Install the platform-specific package for optimal performance.`,
-  );
+function addonInstallHelp(): string {
+  try {
+    return `Reinstall ${packageName()} or set WEBUI_ADDON_PATH to a compatible addon.`;
+  } catch (error) {
+    const platformError = error instanceof Error ? error.message : String(error);
+    return `${platformError} Set WEBUI_ADDON_PATH to a compatible addon.`;
+  }
 }
 
 // ── Build API ────────────────────────────────────────────────────────
@@ -236,97 +241,21 @@ function warnFallback(): void {
 /** Build a WebUI application from an app directory. */
 export function build(options: BuildOptions): BuildResult {
   const native = loadAddon();
-  if (native?.build) {
-    const { projectionManifestObjects, ...nativeOptions } = options;
-    return native.build({
-      ...nativeOptions,
-      projectionManifestObjects: projectionManifestObjects?.map(
-        ({ path, manifest }) => ({
-          path,
-          json: JSON.stringify(manifest),
-        })
-      ),
-    });
-  }
-
-  // Fallback: shell out to CLI binary.
-  const binPath = resolve("bin");
-  if (!binPath) {
+  if (typeof native.build !== "function") {
     throw new Error(
-      "[webui] Cannot build: no native addon or CLI binary available.",
+      `[webui] Native addon is incompatible: build() is required. ${addonInstallHelp()}`,
     );
   }
-
-  const args = ["build", options.appDir ?? "."];
-  if (options.entry) args.push("--entry", options.entry);
-  if (options.css) args.push("--css", options.css);
-  if (options.plugin) args.push("--plugin", options.plugin);
-  if (options.components) {
-    for (const c of options.components) {
-      args.push("--components", c);
-    }
-  }
-  if (options.projectionManifests) {
-    for (const manifest of options.projectionManifests) {
-      args.push("--projection-manifest", manifest);
-    }
-  }
-  if (
-    options.projectionManifestObjects &&
-    options.projectionManifestObjects.length > 0
-  ) {
-    throw new Error(
-      "[webui] Inline projection manifest objects require the native addon; write the manifest and pass projectionManifests when using the CLI fallback."
-    );
-  }
-  if (options.componentAssetRoots && options.componentAssetRoots.length > 0) {
-    args.push("--emit-component-assets", options.componentAssetRoots.join(","));
-  }
-  if (options.cssFileNameTemplate) {
-    args.push("--css-file-name-template", options.cssFileNameTemplate);
-  }
-  if (options.cssPublicBase) {
-    args.push("--css-public-base", options.cssPublicBase);
-  }
-  if (options.theme) args.push("--theme", options.theme);
-  if (options.outDir) args.push("--out", options.outDir);
-
-  execFileSync(binPath, args, { stdio: "inherit" });
-
-  // CLI fallback does not return in-memory protocol.
-  if (options.outDir) {
-    const protocol = fs.readFileSync(nodePath.join(options.outDir, "protocol.bin"));
-    return {
-      protocol,
-      cssFiles: [],
-      componentAssetFiles: readComponentAssetFiles(options.outDir),
-      warnings: [],
-      stats: emptyStats(),
-    };
-  }
-
-  return {
-    protocol: Buffer.alloc(0),
-    cssFiles: [],
-    componentAssetFiles: [],
-    warnings: [],
-    stats: emptyStats(),
-  };
-}
-
-function readComponentAssetFiles(outDir: string): string[] {
-  const files: string[] = [];
-  const entries = fs.readdirSync(outDir, { withFileTypes: true });
-  for (let i = 0; i < entries.length; i++) {
-    const entry = entries[i];
-    if (!entry.isFile()) continue;
-    const name = entry.name;
-    const path = nodePath.join(outDir, name);
-    const content = fs.readFileSync(path, "utf8");
-    if (!content.startsWith("const asset=") || !content.includes("webui-component-asset")) continue;
-    files.push(name, content);
-  }
-  return files;
+  const { projectionManifestObjects, ...nativeOptions } = options;
+  return native.build({
+    ...nativeOptions,
+    projectionManifestObjects: projectionManifestObjects?.map(
+      ({ path, manifest }) => ({
+        path,
+        json: JSON.stringify(manifest),
+      })
+    ),
+  });
 }
 
 // ── Runtime protocol API ─────────────────────────────────────────────
@@ -341,12 +270,10 @@ export class Protocol {
   readonly #native: NativeProtocol;
 
   constructor(protocolData: Buffer, options?: ProtocolOptions) {
-    const native = loadAddon();
-    const NativeProtocol = native?.Protocol;
+    const NativeProtocol = loadAddon().Protocol;
     if (!NativeProtocol) {
-      warnFallback();
       throw new Error(
-        "[webui] Native addon is incompatible: Protocol is required.",
+        `[webui] Native addon is incompatible: Protocol is required. ${addonInstallHelp()}`,
       );
     }
     this.#native = new NativeProtocol(protocolData, options?.plugin);
@@ -510,21 +437,12 @@ function toStateJson(state: object | string): string {
 /** Inspect protocol bytes and return JSON representation. */
 export function inspect(protocolData: Buffer): string {
   const native = loadAddon();
-  if (native?.inspect) {
-    return native.inspect(protocolData);
+  if (typeof native.inspect !== "function") {
+    throw new Error(
+      `[webui] Native addon is incompatible: inspect() is required. ${addonInstallHelp()}`,
+    );
   }
-  throw new Error("[webui] inspect() requires the native addon.");
+  return native.inspect(protocolData);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────
-
-function emptyStats(): BuildStats {
-  return {
-    durationMs: 0,
-    fragmentCount: 0,
-    componentCount: 0,
-    cssFileCount: 0,
-    protocolSizeBytes: 0,
-    tokenCount: 0,
-  };
-}

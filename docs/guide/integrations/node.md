@@ -95,7 +95,7 @@ Deno.serve({ port: 3000 }, (req) => {
 
 | API | Description |
 |----------|-------------|
-| `build(options)` | Build templates into a protocol. Returns `{ protocol, cssFiles, componentAssetFiles, warnings, stats }` |
+| `build(options)` | Build templates into a protocol. Returns `{ protocol, cssFiles, componentAssetFiles, metafile?, warnings, stats }` |
 | `new Protocol(protocol, options?)` | Decode and index protocol bytes once and bind the selected plugin |
 | `protocol.render(state, options?)` | Render into a UTF-8 `Buffer` for direct HTTP writes |
 | `protocol.renderStream(state, onChunk, options?)` | Render with callbacks coalesced around a 16 KiB target before crossing into JavaScript |
@@ -165,8 +165,9 @@ render immediately and propagate to the caller.
 | `plugin` | `string` | - | Parser plugin name (see [Plugins](/guide/concepts/plugins/) for the available identifiers) |
 | `components` | `string[]` | - | External component sources |
 | `componentAssetRoots` | `string[]` | - | Root component tags emitted as static `.webui.js` ESM assets |
+| `metafile` | `boolean` | `false` | Generate and return an esbuild-compatible component asset graph |
 | `projectionManifests` | `string[]` | - | Projection manifest paths, merged with strict scripted-component coverage |
-| `projectionManifestObjects` | `{ path: string; manifest: unknown }[]` | - | Already-transported manifests with logical paths anchoring `root` and stale checks; native addon only |
+| `projectionManifestObjects` | `{ path: string; manifest: unknown }[]` | - | Already-transported manifests with logical paths anchoring `root` and stale checks |
 | `cssFileNameTemplate` | `string` | `"[name].[ext]"` | Emitted asset filename template for Link-mode CSS and component assets. Tokens: `[name]`, `[hash]`, `[ext]` |
 | `cssPublicBase` | `string` | - | Public URL/path prefix for Link-mode CSS hrefs |
 | `legalComments` | `"inline" \| "none"` | `"inline"` | Preserve legal CSS comments inline, or strip all comments |
@@ -180,10 +181,25 @@ const result = build({
 });
 ```
 
+When `componentAssetRoots` contains multiple roots, the build returns a version
+2 asset graph in `componentAssetFiles`: entry-reachable dependencies stay
+external, single-root dependencies stay inline, and dependencies with the same
+multi-root consumer set are emitted once as shared chunks. Asset-only records
+are removed from `result.protocol`. Component assets cannot be combined with
+`<route>`.
+
+Set `metafile: true` to receive
+`result.metafile`. The JSON uses esbuild's `inputs`/`outputs`
+schema, root `entryPoint` records, and `dynamic-import` edges, so it can be
+opened directly in an esbuild bundle analyzer.
+
 Manifest inputs are build-time only. The returned protocol is self-contained,
 and `render()` does not load projection tooling. If no manifest is supplied,
-the build preserves full state. Inline objects require the native addon; the
-CLI fallback accepts manifest paths only.
+the build preserves full state.
+
+The Node API requires the platform-specific native addon. Addon resolution and
+loading errors are returned directly and never trigger a CLI subprocess. Use
+the `webui` CLI explicitly when a filesystem-oriented build is preferred.
 
 ### BuildStats
 

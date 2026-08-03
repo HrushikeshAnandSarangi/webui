@@ -612,7 +612,7 @@ MyComponent.define('my-component');
 | `this.$flushUpdates()` | Synchronously flush pending updates |
 | `protected hydratedCallback()` | Run synchronously once after the first successful hydration or client mount |
 | `static define(tagName)` | Register as a custom element |
-| `defineComponentAssets(manifest)` | Lazy component assets with `preload(tag)` / `create(tag)` |
+| `defineComponentAssets(manifest)` | Lazy component asset graphs with `preload(tag)` / `create(tag)` |
 
 ### Custom events
 
@@ -756,7 +756,8 @@ Without `@microsoft/webui-router`, prebuild the asset and mount it into a
 
 ```bash
 webui build ./src --out ./dist --plugin=webui \
-  --emit-component-assets settings-dialog
+  --emit-component-assets settings-dialog \
+  --metafile ./dist/component-assets-meta.json
 ```
 
 ```typescript
@@ -775,9 +776,13 @@ async onOpenSettings(): Promise<void> {
 }
 ```
 
-`preload(tag)` starts the template asset, JS chunk, and data fetch in parallel
-as soon as the user expresses intent. `create(tag)` waits for the template asset
-and module, then creates the element.
+Assets keep entry-owned templates external, inline dependencies used by one
+asset root, and split dependencies shared by multiple roots into deduplicated
+dynamic chunks. Do not copy generated chunk filenames into the manifest; each
+root asset carries its own dynamic imports. `create(tag)` waits for the template
+graph and module, then creates the element. The normal entry bundle must load
+first. Component assets cannot be combined with `<route>`; use the router for
+routed components.
 
 ## Routing
 
@@ -1042,7 +1047,8 @@ webui inspect ./dist/protocol.bin
 
 Common flags on both commands: `--entry`, `--css <link|style|module>`,
 `--dom <shadow|light>`, `--components`, `--theme`,
-`--projection-manifest`, `--emit-component-assets`, `--format json`.
+`--projection-manifest`, `--emit-component-assets`, `--metafile`,
+`--format json`.
 
 Authoring mistakes fail the build with a structured diagnostic carrying a stable
 code, source location, snippet, and a `help:` fix. Branch on the `code`, never
