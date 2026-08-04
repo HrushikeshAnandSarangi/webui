@@ -678,6 +678,9 @@ pub struct RenderOptions<'a> {
     pub body_inject: Option<&'a str>,
 }
 
+/// Reserved top-level state key carrying host-supplied boundary HTML.
+pub const STATE_INJECT_KEY: &str = "$webui";
+
 impl<'a> RenderOptions<'a> {
     pub fn new(entry_id: &'a str, request_path: &'a str) -> Self;
     pub fn with_nonce(self, nonce: &'a str) -> Self;
@@ -910,6 +913,44 @@ HttpResponse::Ok()
   served over loopback it doesn't help. See `BENCHMARKS.md` for the
   full measurement suite (criterion + custom-allocator + HTTP-level +
   Playwright browser).
+
+### Reserved State Inject Channel
+
+`RenderOptions::with_head_inject` / `with_body_inject` are Rust-only. Hosts
+that reach WebUI through FFI, Node, or WASM already pass a JSON state
+object across the boundary, so the same capability is exposed there through
+a **reserved top-level state key** (`STATE_INJECT_KEY = "$webui"`) instead
+of a new per-host API symbol:
+
+| Member | Emitted at |
+| --- | --- |
+| `headEnd` | immediately before `</head>` |
+| `bodyStart` | immediately after `<body>` |
+| `bodyEnd` | immediately before `</body>` |
+
+Each member is optional and must be a string; anything else (non-object
+`$webui`, `null`, empty string, wrong type, unknown member) is **inert
+rather than an error**. Values are emitted after WebUI's own emissions at the
+same boundary. `headEnd` follows `head_inject`, `bodyEnd` follows `body_inject`,
+and `bodyStart` has no corresponding `RenderOptions` injection. Each is emitted
+once per render (the same defensive dedup as the Rust inject fields).
+
+- **Host owns escaping.** Like `head_inject` / `body_inject`, the values are
+  written **verbatim with no escaping**. The render state is host-supplied,
+  so the reserved key is honored with no extra flag; hosts that merge
+  request-derived data into their state must not let untrusted input reach
+  `$webui`.
+- **Never hydrated.** `$webui` is stripped from the client hydration
+  payload for both full and projected state, so boundary HTML is never
+  re-serialized into the DOM.
+- **Zero-copy.** The members are resolved once when the render context is
+  built and stored as `Option<&str>` borrowed from the caller's state, so
+  each structural hook costs one `Option` check — no map lookup, no clone.
+- **Mode parity.** Buffered, streaming, and owned-streaming renders emit
+  the same bytes at the same boundaries.
+
+The `$` prefix keeps the key from colliding with ordinary application state
+and keeps authored `{{{bodyEnd}}}` bindings resolving as plain state keys.
 
 ### Handler Plugin System
 The handler supports framework-specific hydration plugins. Plugins receive lifecycle
@@ -1987,15 +2028,14 @@ All compiler-owned structural signal values use the internal wire namespace
 `}}}webui:boundary_start:0`). The parser's authored double/triple bindings
 cannot produce a value beginning with `}}}` because those bytes close the
 binding; CSS comment bindings also reject braces in paths. The handler strips
-this prefix only from raw signals before interpreting structure. In protocols
-that contain this namespace, unprefixed values such as authored
-`{{{head_start}}}` and `{{{streaming_root}}}` always remain ordinary public
-state keys. For complete-response compatibility, a runtime protocol containing
-no namespaced structural signal recognizes only the unnamespaced
-`head_end`, `body_start`, and `body_end` hooks. Such a protocol
+this prefix only from raw signals before interpreting structure. Unprefixed
+values such as authored `{{{head_start}}}`, `{{{head_end}}}`,
+`{{{body_start}}}`, `{{{body_end}}}`, and `{{{streaming_root}}}` always remain
+ordinary public state keys. Protocols built before this namespace therefore no
+longer receive structural hooks and must be rebuilt. Such a protocol also
 cannot enter streaming mode because it lacks namespaced `head_start`, boundary,
-and streamed-root signals and must be rebuilt first. This namespace is an
-internal parser/handler contract, not author syntax.
+and streamed-root signals. This namespace is an internal parser/handler
+contract, not author syntax.
 
 Boundary validation — unique static `name`, no nesting, outermost entry
 template only, and "must not cut through a component, native raw/inert content,

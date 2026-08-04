@@ -218,6 +218,60 @@ pub struct RenderOptions<'a> {
     pub body_inject: Option<&'a str>,
 }
 
+/// Reserved top-level state key carrying host-supplied boundary HTML.
+///
+/// The leading `$` marks this key as reserved host metadata rather than
+/// ordinary application state.
+///
+/// Recognized members, each an optional string:
+///
+/// | Member | Emitted at |
+/// | --- | --- |
+/// | `headEnd` | immediately before `</head>` |
+/// | `bodyStart` | immediately after `<body>` |
+/// | `bodyEnd` | immediately before `</body>` |
+///
+/// The key is always honored — it is part of the render state the host
+/// already supplies — and is stripped from the client hydration payload.
+pub const STATE_INJECT_KEY: &str = "$webui";
+
+/// Host-supplied boundary HTML resolved once per render from
+/// [`STATE_INJECT_KEY`].
+///
+/// Resolution happens when the render context is built, so each structural
+/// hook costs one `Option` check instead of a state map lookup. Every field
+/// borrows from the caller's state value — no clone, no allocation.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StateInject<'state> {
+    pub(crate) head_end: Option<&'state str>,
+    pub(crate) body_start: Option<&'state str>,
+    pub(crate) body_end: Option<&'state str>,
+}
+
+impl<'state> StateInject<'state> {
+    /// Resolve the reserved namespace from a render state value.
+    ///
+    /// Returns the empty set when the key is absent, or when any member is
+    /// missing, null, empty, or not a string. Malformed input is inert rather than an error: the reserved
+    /// key is an optional side channel, and a render must not fail because a
+    /// host wrote the wrong shape into it.
+    pub(crate) fn resolve(state: &'state Value) -> Self {
+        let Some(Value::Object(map)) = state.get(STATE_INJECT_KEY) else {
+            return Self::default();
+        };
+        let field = |name: &str| {
+            map.get(name)
+                .and_then(Value::as_str)
+                .filter(|html| !html.is_empty())
+        };
+        Self {
+            head_end: field("headEnd"),
+            body_start: field("bodyStart"),
+            body_end: field("bodyEnd"),
+        }
+    }
+}
+
 impl<'a> RenderOptions<'a> {
     /// Create render options for the given entry fragment and request path.
     #[must_use]
@@ -287,10 +341,6 @@ pub struct WebUIHandler {
 /// Context object for processing WebUI fragments
 pub(crate) struct WebUIProcessContext<'protocol, 'state, 'output> {
     pub(crate) protocol: &'protocol WebUIProtocol,
-    /// Whether this runtime document predates namespaced compiler signals.
-    /// Legacy compatibility is ordinary-render-only; streaming preflight still
-    /// requires the namespaced `head_start` introduced with boundaries.
-    pub(crate) legacy_structural_signals: bool,
     pub(crate) state: &'state Value,
     pub(crate) writer: &'output mut dyn ResponseWriter,
     pub(crate) local_vars: HashMap<String, Value>,
@@ -332,6 +382,11 @@ pub(crate) struct WebUIProcessContext<'protocol, 'state, 'output> {
     /// `</body>`), after the built-in template metadata emissions.
     /// Same zero-copy borrow as [`head_inject`](Self::head_inject).
     pub(crate) body_inject: Option<&'protocol str>,
+    /// Host HTML resolved once per render from the reserved
+    /// [`STATE_INJECT_KEY`] state namespace. Emitted after the built-in
+    /// emissions at each structural boundary, and after the corresponding
+    /// `RenderOptions` inject at `head_end` and `body_end`.
+    pub(crate) state_inject: StateInject<'state>,
     /// Tracks whether the `head_end` hook has already fired in this
     /// render. Defends against malformed protocols that emit the
     /// signal more than once (e.g., a template with multiple `<head>`
@@ -339,6 +394,11 @@ pub(crate) struct WebUIProcessContext<'protocol, 'state, 'output> {
     /// preload `<link>` tags, and the CSP `<meta>` nonce would be
     /// duplicated, which can be a CSP-bypass / cache-bloat vector.
     pub(crate) head_end_emitted: bool,
+    /// Tracks whether the `body_start` hook has already fired in this
+    /// render. Defends against malformed protocols emitting the signal
+    /// twice — without this, state-supplied `bodyStart` HTML would be
+    /// duplicated.
+    pub(crate) body_start_emitted: bool,
     /// Tracks whether the `body_end` hook has already fired in this
     /// render. Defends against malformed protocols emitting the
     /// signal twice — without this, hydration `<script>` blocks and
@@ -378,16 +438,6 @@ pub(crate) fn structural_signal_value(
         return None;
     }
     signal.value.strip_prefix(STRUCTURAL_SIGNAL_PREFIX)
-}
-
-fn legacy_structural_signal_value(signal: &webui_protocol::WebUIFragmentSignal) -> Option<&str> {
-    if !signal.raw {
-        return None;
-    }
-    match signal.value.as_str() {
-        "head_end" | "body_start" | "body_end" => Some(signal.value.as_str()),
-        _ => None,
-    }
 }
 
 /// Maximum scope maps retained in the request-local pool. Small: sibling
@@ -558,6 +608,9 @@ impl Serialize for ProjectedState<'_> {
         if self.keys.len() < map.len() {
             let mut previous = None;
             for key in self.keys {
+                if *key == STATE_INJECT_KEY {
+                    continue;
+                }
                 if previous == Some(*key) {
                     continue;
                 }
@@ -568,6 +621,9 @@ impl Serialize for ProjectedState<'_> {
             }
         } else {
             for (key, value) in map {
+                if key == STATE_INJECT_KEY {
+                    continue;
+                }
                 if self
                     .keys
                     .binary_search_by(|candidate| candidate.cmp(&key.as_str()))
@@ -593,6 +649,52 @@ impl Serialize for ProjectedState<'_> {
 /// Buffering the projected bytes and escaping once is measurably faster than
 /// streaming through a per-token `io::Write` adapter, and the projected buffer
 /// is tiny in the common case.
+/// Serialize a state object with the reserved [`STATE_INJECT_KEY`] entry
+/// omitted.
+///
+/// The reserved key carries host-supplied boundary HTML, not application
+/// state, so it must never reach the client hydration payload — shipping it
+/// would both duplicate the markup as a JSON string and expose the host's
+/// inject channel to client code. Filtering happens during serialization so
+/// the state tree is never cloned.
+struct StateWithoutReservedKey<'a> {
+    value: &'a Value,
+}
+
+impl Serialize for StateWithoutReservedKey<'_> {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let Value::Object(map) = self.value else {
+            return self.value.serialize(serializer);
+        };
+        let mut out = serializer.serialize_map(Some(map.len().saturating_sub(1)))?;
+        for (key, value) in map {
+            if key == STATE_INJECT_KEY {
+                continue;
+            }
+            out.serialize_entry(key, value)?;
+        }
+        out.end()
+    }
+}
+
+/// Write the complete state, stripping the reserved inject key when present.
+///
+/// The membership test is a single map lookup and the common case — no
+/// reserved key — takes the original zero-overhead path unchanged.
+fn write_full_state(
+    writer: &mut dyn ResponseWriter,
+    scratch: &mut Vec<u8>,
+    state: &Value,
+) -> Result<()> {
+    if matches!(state, Value::Object(map) if map.contains_key(STATE_INJECT_KEY)) {
+        return write_script_safe_json(writer, scratch, &StateWithoutReservedKey { value: state });
+    }
+    write_script_safe_json(writer, scratch, state)
+}
+
 pub(crate) fn write_selected_state(
     writer: &mut dyn ResponseWriter,
     scratch: &mut Vec<u8>,
@@ -600,7 +702,7 @@ pub(crate) fn write_selected_state(
     selection: &StateSelection<'_>,
 ) -> Result<()> {
     let keys = match selection {
-        StateSelection::Full => return write_script_safe_json(writer, scratch, state),
+        StateSelection::Full => return write_full_state(writer, scratch, state),
         StateSelection::Keys(keys) => keys.as_slice(),
         StateSelection::BorrowedKeys(keys) => *keys,
     };
@@ -620,7 +722,7 @@ pub(crate) fn write_selected_state(
         let selects_entire_map =
             keys.len() == map.len() && keys.iter().copied().eq(map.keys().map(String::as_str));
         if selects_entire_map {
-            return write_script_safe_json(writer, scratch, state);
+            return write_full_state(writer, scratch, state);
         }
     }
     write_script_safe_json(writer, scratch, &ProjectedState { value: state, keys })
@@ -1430,13 +1532,7 @@ impl WebUIHandler {
         signal: &'data webui_protocol::WebUIFragmentSignal,
         context: &mut WebUIProcessContext<'data, '_, '_>,
     ) -> Result<()> {
-        let structural_value = structural_signal_value(signal).or_else(|| {
-            context
-                .legacy_structural_signals
-                .then(|| legacy_structural_signal_value(signal))
-                .flatten()
-        });
-        let Some(structural_value) = structural_value else {
+        let Some(structural_value) = structural_signal_value(signal) else {
             return self.process_state_signal(signal, context);
         };
 
@@ -1531,6 +1627,23 @@ impl WebUIHandler {
             // built-in nonce + CSS-link emissions, so host injects
             // appear immediately before `</head>`.
             if let Some(html) = context.head_inject {
+                context.writer.write(html)?;
+            }
+
+            // Reserved-state `headEnd` HTML, last at this boundary so a
+            // host that sets both channels gets a deterministic order:
+            // built-in emissions, then `RenderOptions`, then state.
+            if let Some(html) = context.state_inject.head_end {
+                context.writer.write(html)?;
+            }
+        }
+
+        // Hook: emit state-supplied HTML immediately after `<body>`.
+        // Guarded by its own dedup flag so a malformed protocol emitting
+        // the signal twice cannot duplicate the injected markup.
+        if structural_value == "body_start" && !context.body_start_emitted {
+            context.body_start_emitted = true;
+            if let Some(html) = context.state_inject.body_start {
                 context.writer.write(html)?;
             }
         }
@@ -1684,6 +1797,12 @@ impl WebUIHandler {
             // hydration plugin is active. Appears immediately before
             // `</body>`.
             if let Some(html) = context.body_inject {
+                context.writer.write(html)?;
+            }
+
+            // Reserved-state `bodyEnd` HTML, last at this boundary. Same
+            // precedence as `head_end`: built-ins, `RenderOptions`, state.
+            if let Some(html) = context.state_inject.body_end {
                 context.writer.write(html)?;
             }
         }
@@ -1918,7 +2037,6 @@ impl WebUIHandler {
         }
         let mut context = WebUIProcessContext {
             protocol: document,
-            legacy_structural_signals: protocol.legacy_structural_signals(),
             state,
             writer,
             local_vars: HashMap::new(),
@@ -1934,7 +2052,9 @@ impl WebUIHandler {
             nonce: options.nonce.filter(|s| !s.is_empty()),
             head_inject: options.head_inject.filter(|s| !s.is_empty()),
             body_inject: options.body_inject.filter(|s| !s.is_empty()),
+            state_inject: StateInject::resolve(state),
             head_end_emitted: false,
+            body_start_emitted: false,
             component_index: protocol.component_index(),
             body_end_emitted: false,
             route_index: protocol.route_index(),
@@ -8487,6 +8607,310 @@ mod tests {
         assert_eq!(html.matches("<script>lr</script>").count(), 1);
     }
 
+    // ── Reserved `$webui` state inject namespace ──────────────────────
+
+    /// Protocol carrying all three structural boundaries, so `body_start`
+    /// placement can be asserted alongside `head_end` / `body_end`.
+    fn build_all_boundaries_protocol() -> WebUIProtocol {
+        let mut fragments = HashMap::new();
+        fragments.insert(
+            "index.html".to_string(),
+            FragmentList {
+                fragments: vec![
+                    WebUIFragment::raw("<html><head><title>x</title>".to_string()),
+                    structural_fragment("head_end"),
+                    WebUIFragment::raw("</head><body>".to_string()),
+                    structural_fragment("body_start"),
+                    WebUIFragment::raw("hello".to_string()),
+                    structural_fragment("body_end"),
+                    WebUIFragment::raw("</body></html>".to_string()),
+                ],
+            },
+        );
+        WebUIProtocol::new(fragments)
+    }
+
+    fn state_inject_options<'a>() -> RenderOptions<'a> {
+        RenderOptions::new("index.html", "/")
+    }
+
+    fn render_with(protocol: &WebUIProtocol, state: &Value, options: &RenderOptions<'_>) -> String {
+        let mut writer = TestWriter::new();
+        handle(protocol, state, options, &mut writer).unwrap();
+        writer.get_content().to_string()
+    }
+
+    #[test]
+    fn state_inject_emits_at_every_structural_boundary() {
+        let protocol = build_all_boundaries_protocol();
+        let state = test_json!({
+            "$webui": {
+                "headEnd": "<meta name=he>",
+                "bodyStart": "<span id=bs></span>",
+                "bodyEnd": "<script>be</script>",
+            }
+        });
+        let html = render_with(&protocol, &state, &state_inject_options());
+
+        let head_end = html.find("<meta name=he>").expect("headEnd missing");
+        let head_close = html.find("</head>").expect("</head> missing");
+        let body_open = html.find("<body>").expect("<body> missing");
+        let body_start = html.find("<span id=bs></span>").expect("bodyStart missing");
+        let hello = html.find("hello").expect("body content missing");
+        let body_end = html.find("<script>be</script>").expect("bodyEnd missing");
+        let body_close = html.find("</body>").expect("</body> missing");
+
+        assert!(
+            head_end < head_close,
+            "headEnd must precede </head>: {html}"
+        );
+        assert!(
+            body_open < body_start && body_start < hello,
+            "bodyStart must sit immediately after <body>: {html}"
+        );
+        assert!(
+            hello < body_end && body_end < body_close,
+            "bodyEnd must precede </body>: {html}"
+        );
+
+        for needle in [
+            "<meta name=he>",
+            "<span id=bs></span>",
+            "<script>be</script>",
+        ] {
+            assert_eq!(html.matches(needle).count(), 1, "duplicated {needle}");
+        }
+    }
+
+    #[test]
+    fn state_inject_follows_render_options_inject() {
+        let protocol = build_all_boundaries_protocol();
+        let state = test_json!({
+            "$webui": { "headEnd": "<!--state-he-->", "bodyEnd": "<!--state-be-->" }
+        });
+        let options = RenderOptions::new("index.html", "/")
+            .with_head_inject("<!--opt-he-->")
+            .with_body_inject("<!--opt-be-->");
+        let html = render_with(&protocol, &state, &options);
+
+        let opt_he = html.find("<!--opt-he-->").expect("option headEnd missing");
+        let state_he = html.find("<!--state-he-->").expect("state headEnd missing");
+        let opt_be = html.find("<!--opt-be-->").expect("option bodyEnd missing");
+        let state_be = html.find("<!--state-be-->").expect("state bodyEnd missing");
+
+        assert!(
+            opt_he < state_he,
+            "RenderOptions head_inject must precede the state-supplied value: {html}"
+        );
+        assert!(
+            opt_be < state_be,
+            "RenderOptions body_inject must precede the state-supplied value: {html}"
+        );
+    }
+
+    #[test]
+    fn malformed_state_inject_values_are_inert() {
+        let protocol = build_all_boundaries_protocol();
+        // Absent key, wrong container type, and per-member null / empty /
+        // non-string values must all render without output and without error.
+        for state in [
+            test_json!({}),
+            test_json!({ "$webui": "not-an-object" }),
+            test_json!({ "$webui": [] }),
+            test_json!({ "$webui": null }),
+            test_json!({ "$webui": { "headEnd": null, "bodyStart": "", "bodyEnd": 42 } }),
+            test_json!({ "$webui": { "unknownMember": "<b>x</b>" } }),
+        ] {
+            let html = render_with(&protocol, &state, &state_inject_options());
+            assert!(
+                html.contains("<html><head><title>x</title></head><body>hello</body></html>"),
+                "malformed reserved state must render the document unchanged: {html}"
+            );
+            assert!(!html.contains("<b>x</b>"), "unknown member leaked: {html}");
+            assert!(!html.contains("42"), "non-string member leaked: {html}");
+        }
+    }
+
+    #[test]
+    fn state_inject_never_reaches_the_hydration_payload() {
+        let protocol = build_all_boundaries_protocol();
+        let state = test_json!({
+            "visible": "keep",
+            "$webui": { "bodyEnd": "<script>secret</script>" }
+        });
+        let handler = WebUIHandler::with_plugin(|| {
+            Box::new(crate::plugin::webui::WebUIHydrationPlugin::new())
+        });
+        let runtime = Protocol::new(protocol.clone());
+        let mut writer = TestWriter::new();
+        handler
+            .render(&runtime, &state, &state_inject_options(), &mut writer)
+            .unwrap();
+        let html = writer.get_content();
+
+        let data_start = html
+            .find(r#"<script type="application/json" id="webui-data""#)
+            .expect("hydration block missing");
+        let data_end = html[data_start..]
+            .find("</script>")
+            .map(|offset| data_start + offset)
+            .expect("hydration block never closes");
+        let payload = &html[data_start..data_end];
+        assert!(
+            !payload.contains("$webui"),
+            "reserved key must be stripped from the hydration payload: {payload}"
+        );
+        assert!(
+            payload.contains("visible"),
+            "ordinary state must survive the filter: {payload}"
+        );
+        // Per the documented precedence the injected HTML is emitted after
+        // the built-in hydration block, and still before `</body>`.
+        let inject = html
+            .find("<script>secret</script>")
+            .expect("inject missing");
+        let body_close = html.find("</body>").expect("</body> missing");
+        assert!(
+            data_end < inject && inject < body_close,
+            "state bodyEnd must follow the hydration block and precede </body>: {html}"
+        );
+    }
+
+    #[test]
+    fn projected_hydration_strips_reserved_state_inject_key() {
+        let mut fragments = HashMap::new();
+        fragments.insert(
+            "index.html".to_string(),
+            FragmentList {
+                fragments: vec![
+                    WebUIFragment::raw("<html><body>"),
+                    WebUIFragment::component("app-shell"),
+                    structural_fragment("body_end"),
+                    WebUIFragment::raw("</body></html>"),
+                ],
+            },
+        );
+        fragments.insert(
+            "app-shell".to_string(),
+            FragmentList {
+                fragments: vec![WebUIFragment::raw("<p>Shell</p>")],
+            },
+        );
+        let mut document = WebUIProtocol::new(fragments);
+        document.initial_state_strategy = InitialStateStrategy::Components as i32;
+        document.components.insert(
+            "app-shell".to_string(),
+            webui_protocol::ComponentData {
+                hydration_mode: StateProjectionMode::Keys as i32,
+                hydration_keys: vec![STATE_INJECT_KEY.to_string(), "visible".to_string()],
+                ..Default::default()
+            },
+        );
+        let state = test_json!({
+            "$webui": { "bodyEnd": "<script>secret</script>" },
+            "serverOnly": "drop",
+            "visible": "keep",
+        });
+        let handler = WebUIHandler::with_plugin(|| {
+            Box::new(crate::plugin::webui::WebUIHydrationPlugin::new())
+        });
+        let mut writer = TestWriter::new();
+
+        handler
+            .render(
+                &Protocol::new(document),
+                &state,
+                &RenderOptions::new("index.html", "/"),
+                &mut writer,
+            )
+            .unwrap();
+        let html = writer.get_content();
+        let data_start = html
+            .find(r#"<script type="application/json" id="webui-data""#)
+            .expect("hydration block missing");
+        let data_end = html[data_start..]
+            .find("</script>")
+            .map(|offset| data_start + offset)
+            .expect("hydration block never closes");
+        let payload = &html[data_start..data_end];
+
+        assert!(
+            !payload.contains(STATE_INJECT_KEY),
+            "reserved key leaked: {payload}"
+        );
+        assert!(payload.contains(r#""visible":"keep""#), "{payload}");
+        assert!(!payload.contains("serverOnly"), "{payload}");
+        assert!(html.contains("<script>secret</script>"), "{html}");
+    }
+
+    #[test]
+    fn write_selected_state_strips_reserved_key_from_full_state() {
+        let state = test_json!({ "a": 1, "$webui": { "bodyEnd": "<b>x</b>" }, "z": 2 });
+        let mut sink = TestWriter::new();
+        let mut scratch = Vec::new();
+        write_selected_state(&mut sink, &mut scratch, &state, &StateSelection::Full).unwrap();
+        let json = sink.get_content();
+        assert!(!json.contains("$webui"), "reserved key leaked: {json}");
+        assert!(
+            json.contains("\"a\":1") && json.contains("\"z\":2"),
+            "{json}"
+        );
+    }
+
+    #[test]
+    fn write_selected_state_strips_reserved_key_from_borrowed_projection() {
+        let state = test_json!({
+            "$webui": { "bodyEnd": "<b>x</b>" },
+            "keep": 1,
+        });
+        let keys = [STATE_INJECT_KEY, "keep", "missing"];
+        let mut sink = TestWriter::new();
+        let mut scratch = Vec::new();
+
+        write_selected_state(
+            &mut sink,
+            &mut scratch,
+            &state,
+            &StateSelection::BorrowedKeys(&keys),
+        )
+        .unwrap();
+
+        assert_eq!(sink.get_content(), r#"{"keep":1}"#);
+    }
+
+    #[test]
+    fn write_selected_state_full_is_unchanged_without_reserved_key() {
+        let state = test_json!({ "a": 1, "z": 2 });
+        let mut sink = TestWriter::new();
+        let mut scratch = Vec::new();
+        write_selected_state(&mut sink, &mut scratch, &state, &StateSelection::Full).unwrap();
+        assert_eq!(sink.get_content(), r#"{"a":1,"z":2}"#);
+    }
+
+    #[test]
+    fn body_start_hook_dedupes_on_malformed_protocol() {
+        let mut fragments = HashMap::new();
+        fragments.insert(
+            "index.html".to_string(),
+            FragmentList {
+                fragments: vec![
+                    WebUIFragment::raw("<html><head></head><body>".to_string()),
+                    structural_fragment("body_start"),
+                    structural_fragment("body_start"),
+                    WebUIFragment::raw("</body></html>".to_string()),
+                ],
+            },
+        );
+        let protocol = WebUIProtocol::new(fragments);
+        let state = test_json!({ "$webui": { "bodyStart": "<i>once</i>" } });
+        let html = render_with(&protocol, &state, &state_inject_options());
+        assert_eq!(
+            html.matches("<i>once</i>").count(),
+            1,
+            "duplicate body_start signals must not duplicate the inject: {html}"
+        );
+    }
+
     #[test]
     fn injects_are_no_op_when_unset() {
         let protocol = build_head_body_protocol();
@@ -9108,6 +9532,97 @@ mod tests {
         assert!(writer.output.contains("[1,1,3,0,{}]"));
     }
 
+    /// Streaming must place the reserved-state injects exactly where the
+    /// ordinary render does, so a host can switch modes without its
+    /// boundary HTML moving.
+    #[test]
+    fn state_inject_placement_matches_between_render_modes() {
+        let entry = vec![
+            WebUIFragment::raw("<html><head>"),
+            structural_fragment("head_start"),
+            structural_fragment("head_end"),
+            WebUIFragment::raw("</head><body>"),
+            structural_fragment("body_start"),
+            WebUIFragment::raw("<main>static</main>"),
+            structural_fragment("body_end"),
+            WebUIFragment::raw("</body></html>"),
+        ];
+        let fragments =
+            HashMap::from([("index.html".to_string(), FragmentList { fragments: entry })]);
+        let protocol = Protocol::new(WebUIProtocol::new(fragments));
+        let state = test_json!({
+            "$webui": {
+                "headEnd": "<meta name=he>",
+                "bodyStart": "<span id=bs></span>",
+                "bodyEnd": "<script>be</script>",
+            }
+        });
+        let options = RenderOptions::new("index.html", "/");
+
+        let mut ordinary = TestWriter::new();
+        WebUIHandler::new()
+            .render(&protocol, &state, &options, &mut ordinary)
+            .unwrap();
+        let ordinary_html = ordinary.get_content().to_string();
+
+        let mut streamed = FlushTestWriter::default();
+        WebUIHandler::new()
+            .render_streaming(&protocol, &state, &options, &mut streamed)
+            .unwrap();
+        let streamed_html = &streamed.output;
+
+        for html in [ordinary_html.as_str(), streamed_html.as_str()] {
+            let head_end = html.find("<meta name=he>").expect("headEnd missing");
+            let head_close = html.find("</head>").expect("</head> missing");
+            let body_start = html.find("<span id=bs></span>").expect("bodyStart missing");
+            let main = html.find("<main>static</main>").expect("content missing");
+            let body_end = html.find("<script>be</script>").expect("bodyEnd missing");
+            let body_close = html.find("</body>").expect("</body> missing");
+            assert!(head_end < head_close, "headEnd misplaced: {html}");
+            assert!(body_start < main, "bodyStart misplaced: {html}");
+            assert!(
+                main < body_end && body_end < body_close,
+                "bodyEnd misplaced: {html}"
+            );
+        }
+
+        // The streaming response still terminates with its single empty
+        // terminal record: an inject must not perturb the record stream.
+        assert!(
+            streamed_html.contains(",3,0,{}]"),
+            "streaming must still end in one empty terminal record: {streamed_html}"
+        );
+    }
+
+    #[test]
+    fn streaming_state_inject_emits_and_strips_reserved_key() {
+        let entry = vec![
+            WebUIFragment::raw("<html><head>"),
+            structural_fragment("head_start"),
+            structural_fragment("head_end"),
+            WebUIFragment::raw("</head><body>"),
+            structural_fragment("body_start"),
+            structural_fragment("body_end"),
+            WebUIFragment::raw("</body></html>"),
+        ];
+        let fragments =
+            HashMap::from([("index.html".to_string(), FragmentList { fragments: entry })]);
+        let protocol = Protocol::new(WebUIProtocol::new(fragments));
+        let state = test_json!({ "$webui": { "bodyEnd": "<script>be</script>" } });
+
+        let mut writer = FlushTestWriter::default();
+        WebUIHandler::new()
+            .render_streaming(
+                &protocol,
+                &state,
+                &RenderOptions::new("index.html", "/"),
+                &mut writer,
+            )
+            .unwrap();
+        assert!(writer.output.contains("<script>be</script>"));
+        assert!(!writer.output.contains("$webui"));
+    }
+
     #[test]
     fn static_streaming_document_uses_one_empty_terminal_record() {
         let fragments = HashMap::from([(
@@ -9409,48 +9924,34 @@ mod tests {
         assert_eq!(streaming.output.matches("data-webui-boundary").count(), 1);
     }
 
+    /// Only `}}}webui:`-namespaced signals are compiler-owned, so an
+    /// unprefixed `body_end` is ordinary authored content.
     #[test]
-    fn ordinary_render_preserves_legacy_unnamespaced_structural_hooks() {
+    fn unnamespaced_signal_is_ordinary_content() {
         let fragments = HashMap::from([(
             "index.html".to_string(),
             FragmentList {
                 fragments: vec![
                     WebUIFragment::raw("<html><head>"),
-                    WebUIFragment::signal("head_end".to_string(), true),
+                    structural_fragment("head_end"),
                     WebUIFragment::raw("</head><body>"),
-                    WebUIFragment::signal("body_start".to_string(), true),
-                    WebUIFragment::raw("<p>legacy</p>"),
-                    WebUIFragment::signal("body_end".to_string(), true),
+                    WebUIFragment::signal("body_end".to_string(), false),
+                    structural_fragment("body_end"),
                     WebUIFragment::raw("</body></html>"),
                 ],
             },
         )]);
         let protocol = Protocol::new(WebUIProtocol::new(fragments));
-        let handler = WebUIHandler::with_plugin(|| {
-            Box::new(crate::plugin::webui::WebUIHydrationPlugin::new())
-        });
-        let options = RenderOptions::new("index.html", "/").with_nonce("test-legacy-nonce");
         let mut writer = TestWriter::new();
-
-        handler
-            .render(&protocol, &test_json!({}), &options, &mut writer)
-            .unwrap();
-
-        let html = writer.get_content();
-        assert!(html.contains(r#"<meta name="webui-nonce" content="test-legacy-nonce">"#));
-        assert!(html.contains(r#"<script type="application/json" id="webui-data""#));
-        assert!(html.contains("<p>legacy</p>"));
-
-        let mut streaming = FlushTestWriter::default();
-        assert!(matches!(
-            handler.render_streaming(
+        WebUIHandler::new()
+            .render(
                 &protocol,
-                &test_json!({}),
+                &test_json!({ "body_end": "content" }),
                 &RenderOptions::new("index.html", "/"),
-                &mut streaming,
-            ),
-            Err(HandlerError::MissingStreamingHeadStart { .. })
-        ));
+                &mut writer,
+            )
+            .expect("current protocol must render");
+        assert!(writer.get_content().contains("content"));
     }
 
     #[test]

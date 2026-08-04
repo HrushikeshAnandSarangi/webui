@@ -84,6 +84,7 @@ pub struct StreamingResponse<'a, W: FlushWriter + ?Sized> {
     nonce: Option<&'a str>,
     head_inject: Option<&'a str>,
     body_inject: Option<&'a str>,
+    /// Index of the next entry fragment to write.
     cursor: usize,
     next_boundary: usize,
     shell_written: bool,
@@ -96,6 +97,7 @@ pub struct StreamingResponse<'a, W: FlushWriter + ?Sized> {
     plugin: Option<Box<dyn HandlerPlugin>>,
     route_children: Vec<webui_protocol::WebUiFragmentRoute>,
     head_end_emitted: bool,
+    body_start_emitted: bool,
     body_end_emitted: bool,
     route_chain_index: usize,
     entry_route: Option<(String, crate::route_matcher::RouteMatch)>,
@@ -138,6 +140,7 @@ pub(super) struct ParkedResponse {
     plugin: Option<Box<dyn HandlerPlugin>>,
     route_children: Vec<webui_protocol::WebUiFragmentRoute>,
     head_end_emitted: bool,
+    body_start_emitted: bool,
     body_end_emitted: bool,
     route_chain_index: usize,
     entry_route: Option<(String, crate::route_matcher::RouteMatch)>,
@@ -165,6 +168,7 @@ impl<'a, W: FlushWriter + ?Sized> StreamingResponse<'a, W> {
             plugin: self.plugin,
             route_children: self.route_children,
             head_end_emitted: self.head_end_emitted,
+            body_start_emitted: self.body_start_emitted,
             body_end_emitted: self.body_end_emitted,
             route_chain_index: self.route_chain_index,
             entry_route: self.entry_route,
@@ -219,6 +223,7 @@ impl<'a, W: FlushWriter + ?Sized> StreamingResponse<'a, W> {
             plugin: parked.plugin,
             route_children: parked.route_children,
             head_end_emitted: parked.head_end_emitted,
+            body_start_emitted: parked.body_start_emitted,
             body_end_emitted: parked.body_end_emitted,
             route_chain_index: parked.route_chain_index,
             entry_route: parked.entry_route,
@@ -289,6 +294,7 @@ impl WebUIHandler {
             plugin: self.plugin_factory.map(|factory| factory()),
             route_children: Vec::new(),
             head_end_emitted: false,
+            body_start_emitted: false,
             body_end_emitted: false,
             route_chain_index: 0,
             entry_route,
@@ -537,7 +543,6 @@ impl<'a, W: FlushWriter + ?Sized> StreamingResponse<'a, W> {
     ) -> Result<T> {
         let mut context = WebUIProcessContext {
             protocol: self.protocol.protocol(),
-            legacy_structural_signals: self.protocol.legacy_structural_signals(),
             state,
             writer: &mut self.sink,
             local_vars: std::mem::take(&mut self.local_vars),
@@ -552,7 +557,9 @@ impl<'a, W: FlushWriter + ?Sized> StreamingResponse<'a, W> {
             component_index: self.protocol.component_index(),
             head_inject: self.head_inject,
             body_inject: self.body_inject,
+            state_inject: crate::StateInject::resolve(state),
             head_end_emitted: self.head_end_emitted,
+            body_start_emitted: self.body_start_emitted,
             body_end_emitted: self.body_end_emitted,
             route_index: self.protocol.route_index(),
             route_chain_index: self.route_chain_index,
@@ -569,6 +576,7 @@ impl<'a, W: FlushWriter + ?Sized> StreamingResponse<'a, W> {
         self.plugin = context.plugin.take();
         self.route_children = std::mem::take(&mut context.route_children);
         self.head_end_emitted = context.head_end_emitted;
+        self.body_start_emitted = context.body_start_emitted;
         self.body_end_emitted = context.body_end_emitted;
         self.route_chain_index = context.route_chain_index;
         self.json_scratch = std::mem::take(&mut context.json_scratch);

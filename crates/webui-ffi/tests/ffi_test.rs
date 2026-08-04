@@ -417,6 +417,89 @@ fn build_protocol_with_body_end() -> Vec<u8> {
     protocol.to_protobuf().expect("serialize test protocol")
 }
 
+/// The reserved `$webui` state channel must work end-to-end through the
+/// existing `webui_handler_render` symbol: hosts get boundary injection with
+/// no new per-string C API, and the reserved key never leaks into the
+/// hydration payload.
+#[test]
+fn state_inject_channel_needs_no_new_render_symbol() {
+    let proto_bytes = build_protocol_with_body_end();
+
+    unsafe {
+        let handler = webui_handler_create();
+        let prepared = prepare_protocol(&proto_bytes);
+
+        let c_json = CString::new(
+            r#"{"$webui":{"headEnd":"<meta name='he'>","bodyEnd":"<script>be</script>"}}"#,
+        )
+        .expect("static string");
+        let c_entry = CString::new("index.html").expect("static string");
+        let c_path = CString::new("/").expect("static string");
+
+        let ptr = webui_handler_render(
+            handler,
+            prepared,
+            c_json.as_ptr(),
+            c_entry.as_ptr(),
+            c_path.as_ptr(),
+        );
+        assert!(
+            !ptr.is_null(),
+            "render returned NULL: {}",
+            last_error_string().unwrap_or_else(|| "<none>".to_string())
+        );
+        let result = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        webui_free(ptr);
+
+        let head_end = result.find("<meta name='he'>").expect("headEnd missing");
+        let head_close = result.find("</head>").expect("</head> missing");
+        let body_end = result.find("<script>be</script>").expect("bodyEnd missing");
+        let body_close = result.find("</body>").expect("</body> missing");
+        assert!(head_end < head_close, "headEnd misplaced:\n{result}");
+        assert!(body_end < body_close, "bodyEnd misplaced:\n{result}");
+        assert!(
+            !result.contains("$webui"),
+            "reserved key must never reach the hydration payload:\n{result}"
+        );
+
+        webui_protocol_destroy(prepared);
+        webui_handler_destroy(handler);
+    }
+}
+
+/// A malformed `$webui` value is inert rather than an error, and the
+/// reserved key is still stripped from the hydration payload.
+#[test]
+fn malformed_state_inject_is_inert() {
+    let proto_bytes = build_protocol_with_body_end();
+
+    unsafe {
+        let handler = webui_handler_create();
+        let prepared = prepare_protocol(&proto_bytes);
+
+        let c_json = CString::new(r#"{"$webui":"not-an-object"}"#).expect("static string");
+        let c_entry = CString::new("index.html").expect("static string");
+        let c_path = CString::new("/").expect("static string");
+
+        let ptr = webui_handler_render(
+            handler,
+            prepared,
+            c_json.as_ptr(),
+            c_entry.as_ptr(),
+            c_path.as_ptr(),
+        );
+        assert!(!ptr.is_null());
+        let result = CStr::from_ptr(ptr).to_string_lossy().into_owned();
+        webui_free(ptr);
+
+        assert!(!result.contains("not-an-object"), "got:\n{result}");
+        assert!(!result.contains("$webui"), "got:\n{result}");
+
+        webui_protocol_destroy(prepared);
+        webui_handler_destroy(handler);
+    }
+}
+
 #[test]
 fn handler_set_nonce_applies_to_render() {
     let proto_bytes = build_protocol_with_body_end();

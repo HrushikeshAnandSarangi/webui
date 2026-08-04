@@ -126,6 +126,26 @@ The nonce is written verbatim — pass the raw base64 string without any encodin
 `webui_handler_set_nonce` or `webui_handler_destroy` while another operation is
 using the same handler.
 
+### Reserved `$webui` state channel
+
+A top-level `$webui` object in the render state JSON passed to
+`webui_handler_render` (or a streaming session) may carry `headEnd`,
+`bodyStart`, and `bodyEnd` strings, each emitted **raw** at the matching
+structural boundary (before `</head>`, after `<body>`, before `</body>`):
+
+```json
+{"$webui": {"headEnd": "<meta name=\"x\">", "bodyEnd": "<script src=\"/a.js\"></script>"}}
+```
+
+Members that are missing, `null`, empty, or not strings are ignored rather than
+an error. The `$webui` key is stripped from the client hydration payload, so it
+never reaches the DOM. No extra API call is needed — it travels on the state
+JSON hosts already send.
+
+**Safety.** The values are written verbatim with no escaping, exactly like the
+Rust `head_inject` / `body_inject` options. Never let untrusted request input
+reach the `$webui` key.
+
 ### webui_protocol_create / webui_protocol_destroy
 
 ```c

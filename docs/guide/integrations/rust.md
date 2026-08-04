@@ -310,6 +310,30 @@ trace IDs.
 
 > **Safety:** the HTML is written verbatim, no escaping. Untrusted input is a direct XSS vector. Pre-escape with `webui_handler::encode_safe` (re-exported for this purpose) if your content path may include user data.
 
+### Reserved `$webui` state channel
+
+A reserved top-level `"$webui"` object in the render state carries the same
+boundary HTML without a Rust-only builder, so non-Rust hosts get the capability
+through the state JSON they already send:
+
+```json
+{
+  "$webui": {
+    "headEnd": "<link rel=\"preload\" as=\"image\" href=\"/hero.avif\">",
+    "bodyStart": "<!-- after <body> -->",
+    "bodyEnd": "<script src=\"/livereload.js\"></script>"
+  }
+}
+```
+
+Every member is optional and must be a string; anything else is ignored rather
+than an error. The key is stripped from the hydration payload, so it never
+reaches the client. `headEnd` is emitted after `with_head_inject`, and `bodyEnd`
+is emitted after `with_body_inject`. `bodyStart` has no corresponding
+`RenderOptions` injection.
+
+> **Safety:** values are written verbatim with no escaping, exactly like `with_head_inject`. Never let request-derived data reach `$webui`.
+
 ### Typed streaming errors
 
 `StreamingWriter` returns `HandlerError::ClientDisconnected` (receiver dropped)
