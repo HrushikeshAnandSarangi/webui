@@ -295,7 +295,7 @@ optional parameters. Exact matches (most literal segments) take precedence over 
 
 **Server-side rendering:** When the handler encounters `Fragment::Route`:
 1. Pre-scan siblings, pick the best match by specificity.
-2. Matched route: emit `<webui-route path="..." component="..." active data-ri="N">` (where N is the route chain index), render component, recurse into children. Attributes emitted on matched routes: `path`, `component`, `active`, `exact`, `pending`, `error`, `data-ri`. Routing metadata (`query`, `keep-alive`, `cache-tags`, `invalidates`) is **not** emitted as DOM attributes — it is included in the SSR `window.__webui` chain JSON instead.
+2. Matched route: emit `<webui-route path="..." component="..." active data-ri="N">` (where N is the route chain index), render component, recurse into children. Attributes emitted on matched routes: `path`, `component`, `active`, `exact`, `pending`, `error`, `keep-alive`, `data-ri`. Routing metadata (`query`, `cache-tags`, `invalidates`) is **not** emitted as DOM attributes — it is included in the SSR `window.__webui` chain JSON instead. `keep-alive` remains on unmatched placeholders so pending UI can be skipped before the destination partial resolves.
 3. Non-matched routes: emit `<webui-route ... style="display:none">`.
 
 For the WebUI framework path, matched route components do **not** receive route
@@ -362,8 +362,8 @@ emit WebUI `templates` or `templateFns`.
 **Client-side navigation:**
 1. On initial load, the router reads `window.__webui` for the SSR chain, inventory, and nonce. It hydrates matched `<webui-route>` elements using the `data-ri` attribute for O(1) indexed lookup instead of DOM walking. While active, it installs a nonce-bearing `@view-transition { navigation: none; }` override and removes it on `destroy()`. This disables automatic cross-document transitions without affecting explicit same-document `document.startViewTransition()` commits.
 2. `RouterConfig` supports `ssrFresh?: boolean` (default `true`) — when set, the router skips the initial loader replay because SSR state is authoritative. Components can opt into loader replay at startup by declaring `static ssrLoader = true`.
-3. On navigation, fetches a partial response (`Accept: application/x-ndjson, application/json`) from the server.
-4. The server returns the matched route chain; the client does NOT perform route matching.
+3. On navigation, fetches a partial response (`Accept: application/x-ndjson, application/json`) from the server. The initial response, including the JSON body or first NDJSON chain chunk, has a 10-second deadline. A router-owned controller cancels a deferred NDJSON reader when a newer navigation starts or the router is destroyed; the deadline itself is cleared after the initial chunk so deferred state is not time-limited.
+4. The server returns the authoritative matched route chain; the client does NOT select route content. Before that chain is available, the client may match the SSR-emitted hidden route placeholders solely to choose the destination's pending/error boundary. This bounded fallback uses the same literal, `:param`, `:param?`, `*splat`, exactness, specificity, and relative-path semantics as server matching. If more than one sibling has the same winning specificity, the client defers to an inherited boundary rather than guessing from SSR DOM order.
 5. Newly received templates are registered and published through `webui:templates-registered`, allowing the framework to define compiler-owned hosts before commit.
 6. Configured authored loaders run. If the destination tag is still unregistered, the router performs document navigation.
 7. Otherwise, the router reconciles old vs new chain — finds first changed level.
