@@ -49,7 +49,12 @@ import {
 } from './templates.js';
 import type { StreamingContext } from './streaming.js';
 import { ensureComponentLoaded, resolveLoaders, LOADER_FAILED } from './loaders.js';
-import { buildChainFromSSR, findChangeLevel, findOrCreateRouteElement } from './chain.js';
+import {
+  buildChainFromSSR,
+  findChangeLevel,
+  findOrCreateRouteElement,
+  sameRouteDeclaration,
+} from './chain.js';
 import { findErrorComponent, findPendingComponent } from './route-boundary.js';
 
 export { parseQuery, filterQuery, WebUIRouteElement };
@@ -821,10 +826,30 @@ export class WebUIRouter {
     const isQueryOnlyChange = changeLevel === newChain.length && newChain.length > 0;
 
     const commitNavigation = (): void => {
-      // Deactivate old chain from leaf up
+      // Deactivate old chain from leaf up. An entry whose declaration won't
+      // be reused by the incoming chain (a sibling route matched instead —
+      // e.g. two `<route>`s sharing a component but distinguished by path)
+      // has its mounted component destroyed so it doesn't linger, invisible,
+      // in the DOM. Entries kept for in-place reuse (same declaration, or
+      // opted into `keep-alive`) are left mounted.
       for (let i = this.activeChain.length - 1; i >= changeLevel; i--) {
-        if (this.activeChain[i].el) deactivateRoute(this.activeChain[i].el!);
-        this.activeChain[i].compEl = undefined; // Release component reference
+        const oldEntry = this.activeChain[i];
+        if (oldEntry.el) {
+          const newEntry = i < newChain.length ? newChain[i] : undefined;
+          const willReuse = newEntry !== undefined && sameRouteDeclaration(oldEntry, newEntry);
+          if (!willReuse) {
+            const isKeepAlive = oldEntry.keepAlive || getRouteMeta(oldEntry.el)?.keepAlive || false;
+            if (!isKeepAlive) {
+              const existing = oldEntry.compEl ?? oldEntry.el.firstElementChild;
+              if (existing && typeof (existing as unknown as { $destroy?: () => void }).$destroy === 'function') {
+                (existing as unknown as { $destroy: () => void }).$destroy();
+              }
+              oldEntry.el.textContent = '';
+            }
+          }
+          deactivateRoute(oldEntry.el);
+        }
+        oldEntry.compEl = undefined; // Release component reference
       }
       for (let i = 0; i < changeLevel; i++) {
         newChain[i].el = this.activeChain[i].el;
@@ -846,7 +871,7 @@ export class WebUIRouter {
         const entry = newChain[i];
         const oldEntry = i < this.activeChain.length ? this.activeChain[i] : null;
         const parent = i > 0 ? newChain[i - 1] : null;
-        if (oldEntry?.component === entry.component && oldEntry?.el) {
+        if (oldEntry?.el && sameRouteDeclaration(oldEntry, entry)) {
           entry.el = oldEntry.el;
           entry.compEl = oldEntry.compEl;
           setRouteMeta(entry.el, {
