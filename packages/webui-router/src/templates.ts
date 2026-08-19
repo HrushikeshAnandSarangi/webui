@@ -12,6 +12,8 @@
 
 /** Shared event name understood by optional framework runtimes. */
 const TEMPLATES_REGISTERED_EVENT = 'webui:templates-registered';
+const READINESS_COMPLETE = (): true => true;
+const IGNORE_READINESS_RESULTS = (): void => {};
 
 /**
  * Register templates + inject CSS from a server response.
@@ -30,7 +32,7 @@ export function registerTemplatesAndStyles(
   nonce: string,
   injectedStyles: Set<string>,
   updateInventory: (inv: string) => void,
-): void {
+): Promise<void> | undefined {
   if (data.inventory) {
     updateInventory(data.inventory);
   }
@@ -139,7 +141,7 @@ export function registerTemplatesAndStyles(
     document.head.removeChild(script);
   }
 
-  notifyTemplatesRegistered(registeredTemplates);
+  return notifyTemplatesRegistered(registeredTemplates);
 }
 
 /** Inject CSS stylesheet links from a partial response. */
@@ -158,6 +160,32 @@ export function injectCssLinks(
       }
     }
   }
+}
+
+/** Await optional runtime readiness while allowing a stale navigation to stop promptly. */
+export function waitForTemplateReadiness(
+  ready: Promise<void>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!signal) return ready.then(READINESS_COMPLETE);
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise<boolean>((resolve, reject) => {
+    const onAbort = (): void => {
+      signal.removeEventListener('abort', onAbort);
+      resolve(false);
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    ready.then(
+      () => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(true);
+      },
+      error => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 /**
@@ -181,23 +209,41 @@ export async function fetchComponentTemplates(
   const data = await resp.json();
 
   // Register using the same pipeline as partial navigation
-  registerTemplatesAndStyles(data, nonce, injectedStyles, updateInventory);
+  const ready = registerTemplatesAndStyles(data, nonce, injectedStyles, updateInventory);
+  if (ready) await ready;
 }
 
 /** Announce newly registered WebUI templates. */
 export function notifyTemplatesRegistered(
   templates: Record<string, unknown> | undefined,
-): void {
+): Promise<void> | undefined {
   if (
     !templates ||
     typeof window === 'undefined' ||
     typeof CustomEvent !== 'function' ||
     typeof window.dispatchEvent !== 'function'
   ) {
-    return;
+    return undefined;
   }
 
-  window.dispatchEvent(new CustomEvent(TEMPLATES_REGISTERED_EVENT, {
-    detail: { templates },
-  }));
+  let pending: PromiseLike<unknown>[] | undefined;
+  let accepting = true;
+  const waitUntil = (promise: PromiseLike<unknown>): void => {
+    if (!accepting) {
+      throw new Error(
+        '[Router] webui:templates-registered waitUntil() must be called during event dispatch.',
+      );
+    }
+    (pending ??= []).push(promise);
+  };
+  try {
+    window.dispatchEvent(new CustomEvent(TEMPLATES_REGISTERED_EVENT, {
+      detail: { templates, waitUntil },
+    }));
+  } finally {
+    accepting = false;
+  }
+  return pending
+    ? Promise.all(pending).then(IGNORE_READINESS_RESULTS)
+    : undefined;
 }

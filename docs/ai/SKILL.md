@@ -661,7 +661,7 @@ image from `hydratedCallback()` when component state depends on `@load` or
 | `this.$flushUpdates()` | Synchronously flush pending updates |
 | `protected hydratedCallback()` | Run synchronously once after the first successful hydration or client mount |
 | `static define(tagName)` | Register as a custom element |
-| `defineComponentAssets(manifest)` | Lazy component asset graphs with `preload(tag)` / `create(tag)` |
+| `defineComponentAssets(manifest)` | Lazy component asset graphs from stable URLs or bundler importer callbacks, with compiler-owned Shadow Link preloading through `preload(tag)` / `create(tag)` |
 
 ### Custom events
 
@@ -799,6 +799,16 @@ await Router.ensureLoaded('settings-dialog');
 this.showSettings = true;
 ```
 
+With the framework loaded, `ensureLoaded()` also waits for bounded Link
+stylesheet cache warming or a native-link fallback decision. Warmup bytes are
+never applied; the first mounted instance remains guarded until the browser
+validates its native link and can seed the shared constructable sheet. Redirect,
+service-worker, authored `<style>`, or inaccessible-CSSOM cases keep the native
+link rather than risking different response-base or cascade semantics.
+If an authoritative native link fails, WebUI reports the error, keeps the link
+native, releases the temporary guard, and completes hydration so the component
+remains visible and usable even if it is unstyled.
+
 ```html
 <if condition="showSettings">
   <settings-dialog @close="{onCloseSettings()}"></settings-dialog>
@@ -830,13 +840,24 @@ async onOpenSettings(): Promise<void> {
 }
 ```
 
+The compiler stores final Link stylesheet hrefs in the protocol. Shadow builds
+publish them as inert head JSON that `preload(tag)` consumes automatically;
+Light builds emit them as document stylesheets. Authored code therefore keeps
+only the stable root asset URL and never invents or hardcodes a content-hashed
+stylesheet filename.
+Automatic Shadow intent preloading requires HTML rendered through the WebUI
+handler or `Protocol`, which emits `#webui-component-assets`. Using build
+artifacts without rendering the protocol preserves the guarded native mount but
+does not provide early compiler-owned style preloading.
+
 Assets keep entry-owned templates external, inline dependencies used by one
 asset root, and split dependencies shared by multiple roots into deduplicated
 dynamic chunks. Do not copy generated chunk filenames into the manifest; each
 root asset carries its own dynamic imports. `create(tag)` waits for the template
-graph and module, then creates the element. The normal entry bundle must load
-first. Component assets cannot be combined with `<route>`; use the router for
-routed components.
+graph and module, then creates the element. Failed asset or authored module work
+is evicted so a later `preload(tag)` or `create(tag)` retries. The normal entry
+bundle must load first. Component assets cannot be combined with `<route>`; use
+the router for routed components.
 
 ## Routing
 

@@ -19,20 +19,32 @@ import {
   registerAssetStyles,
   type PreparedAssetStyles,
 } from './resources.js';
+import { prepareRegisteredLinkStyles } from '../element/link-styles.js';
+import type { ComponentAssetSource } from './manifest.js';
 
 const assetModulePromises = new Map<string, Promise<unknown>>();
 
 interface PreparedComponentAsset {
   asset: ComponentAsset;
+  linkStyles?: Promise<void>;
   styles: PreparedAssetStyles;
 }
 
 /** Import, validate, and atomically register one component asset graph. */
 export function loadComponentAsset(
   tag: string,
-  url: string | URL,
+  source: ComponentAssetSource,
 ): Promise<void> {
-  const assetUrl = new URL(url, document.baseURI);
+  if (typeof source === 'function') {
+    return Promise.resolve()
+      .then(source)
+      .then(imported => registerRootAsset(
+        tag,
+        `component asset loader for <${tag}>`,
+        imported,
+      ));
+  }
+  const assetUrl = new URL(source, document.baseURI);
   const href = assetUrl.href;
   return loadAssetModule(href, () => import(assetUrl.href))
     .then(imported => registerRootAsset(tag, href, imported));
@@ -58,6 +70,14 @@ async function registerRootAsset(
     registerComponentPayload(chunks[i]);
   }
   registerComponentPayload(root);
+  let pendingStyles: Promise<void>[] | undefined;
+  for (let i = 0; i < chunks.length; i++) {
+    const ready = chunks[i].linkStyles;
+    if (!ready) continue;
+    (pendingStyles ??= []).push(ready);
+  }
+  if (root.linkStyles) (pendingStyles ??= []).push(root.linkStyles);
+  if (pendingStyles) await Promise.all(pendingStyles);
 }
 
 function loadAssetModule(
@@ -109,6 +129,7 @@ function prepareComponentPayload(asset: ComponentAsset): PreparedComponentAsset 
   prepareAssetTemplateData(asset.templates, asset.templateFunctions);
   return {
     asset,
+    linkStyles: prepareRegisteredLinkStyles(asset.templates),
     styles: prepareAssetStyles(asset.templateStyles),
   };
 }
