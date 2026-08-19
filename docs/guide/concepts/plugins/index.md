@@ -33,6 +33,15 @@ webui serve ./my-app --state ./data/state.json --plugin=<name>
 When a plugin is selected, both its parser-side and (for `serve`) handler-side
 implementations are loaded.
 
+### Built-in plugin identifiers
+
+| Name | Behavior |
+|------|----------|
+| `fast` | Deprecated alias for `fast-v2` |
+| `fast-v2` | Deprecated FAST 2 compatibility name |
+| `fast-v3` | FAST 3 hydration plugin |
+| `webui` | WebUI framework hydration plugin |
+
 ## Using Plugins with Handlers
 
 <webui-press-tabs>

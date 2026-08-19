@@ -298,8 +298,14 @@ optional parameters. Exact matches (most literal segments) take precedence over 
 2. Matched route: emit `<webui-route path="..." component="..." active data-ri="N">` (where N is the route chain index), render component, recurse into children. Attributes emitted on matched routes: `path`, `component`, `active`, `exact`, `pending`, `error`, `keep-alive`, `data-ri`. Routing metadata (`query`, `cache-tags`, `invalidates`) is **not** emitted as DOM attributes — it is included in the SSR `window.__webui` chain JSON instead. `keep-alive` remains on unmatched placeholders so pending UI can be skipped before the destination partial resolves.
 3. Non-matched routes: emit `<webui-route ... style="display:none">`.
 
-For the WebUI framework path, matched route components do **not** receive route
-state as scalar attributes or `data-state`. Initial SSR state comes from the
+For FAST plugins, matched route components expose scalar route state as
+kebab-case HTML attributes. Strings, numbers, and booleans are emitted.
+Complex values should be initialized from the rendered DOM or another
+documented mechanism appropriate to the component. Keep FAST route payloads
+flat when the component reads them via `@attr`.
+
+For the WebUI framework plugin path, matched route components do **not**
+receive route state as scalar attributes. Initial SSR state comes from the
 rendered DOM plus hydration markers, and client-side navigations apply fresh
 state through the partial-response `setState(...)` path.
 
@@ -980,6 +986,7 @@ pub trait HandlerPlugin: Send {
     fn on_repeat_item_start(&mut self, index: usize, writer: &mut dyn ResponseWriter) -> Result<()>;
     fn on_repeat_item_end(&mut self, index: usize, writer: &mut dyn ResponseWriter) -> Result<()>;
     fn on_element_data(&mut self, data: &[u8], writer: &mut dyn ResponseWriter) -> Result<()>;
+    /// Write framework-specific route component opening-tag attributes.
     fn write_route_component_state(
         &self,
         state: &serde_json::Value,
@@ -1013,12 +1020,18 @@ sendable handle instead.
 
 **Selecting handler plugins**
 
-The CLI and host APIs select handler plugins by name (passed as a string). No plugin
-is loaded by default; output is plain SSR HTML unless a plugin is selected.
+The CLI and host APIs select handler plugins by name (passed as a string). No
+plugin is loaded by default; output is plain SSR HTML unless a plugin is
+selected.
 
-The set of available plugin names is implementation-defined; refer to the CLI and
-crate documentation for the current list. Each plugin emits its own framework-specific
-hydration markers and attributes; WebUI itself does not interpret them.
+The shipped handler names are:
+- `fast` - deprecated alias for `fast-v2`
+- `fast-v2` - deprecated FAST 2 compatibility name
+- `fast-v3` - FAST 3 hydration plugin
+- `webui` - WebUI framework hydration plugin
+
+Each plugin emits its own framework-specific hydration markers and
+attributes; WebUI itself does not interpret them.
 
 **Usage:**
 ```rust
