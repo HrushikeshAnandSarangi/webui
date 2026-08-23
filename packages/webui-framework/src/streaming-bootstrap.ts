@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 import { registerTemplateData } from './template.js';
+import { registerComponentStyles } from './element/styles.js';
 import type {
   BoundaryBootstrap,
   SpanCompletionPayload,
@@ -11,6 +12,7 @@ import type {
 export function applyBoundaryBootstrap(
   bootstrap: BoundaryBootstrap | SpanCompletionPayload,
 ): void {
+  registerComponentStyles(bootstrap.componentStyles);
   if (bootstrap.templates) registerTemplateData(bootstrap.templates);
 
   const w = window as Window;
@@ -23,6 +25,7 @@ export function applyBoundaryBootstrap(
     if (
       key === 'templates' ||
       key === 'state' ||
+      key === 'componentStyles' ||
       key === 'declarationId' ||
       key === 'enclosingSpanInstanceId'
     ) continue;

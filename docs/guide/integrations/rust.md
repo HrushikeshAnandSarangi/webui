@@ -313,6 +313,14 @@ authoring and lifecycle contract. That application entry must import
 `@microsoft/webui-framework/streaming.js` before component registration
 modules. The default framework entry does not include the streaming coordinator.
 
+Each checkpoint carries state and templates for the component surface reachable
+from roots rendered since the previous checkpoint, including descendants behind
+initially false conditions or empty repeats. Unrelated later boundaries remain
+excluded. Template metadata is sent only when first reachable, inventory still
+tracks only rendered SSR roots, and repeated instances receive checkpoint-local
+state without duplicate metadata. The final terminal envelope is always
+`[2,nextSequence,4,0,{}]`; its flush also commits preceding static tail bytes.
+
 At `start`, WebUI freezes only projected top-level keys required to continue,
 plus lexical locals and route/component scope. Resume state overlays that frozen
 parent surface. Resolution order is lexical locals, resume state, then frozen
@@ -396,6 +404,7 @@ delivery from a cancelled or stalled stream.
 | `app_dir` | `PathBuf` | - | Path to app folder |
 | `entry` | `String` | `"index.html"` | Entry file |
 | `css` | `CssStrategy` | `Link` | CSS delivery: `Link`, `Style`, or `Module` |
+| `dom` | `DomStrategy` | `Shadow` | Fallback for unwrapped components: `Shadow` or global `Light` |
 | `plugin` | `Option<Plugin>` | `None` | Parser plugin (see [Plugins](/guide/concepts/plugins/) for the available identifiers) |
 | `components` | `Vec<String>` | `[]` | External component sources |
 | `component_asset_roots` | `Vec<String>` | `[]` | Root component tags emitted as static `.webui.js` ESM assets |
@@ -404,6 +413,12 @@ delivery from a cancelled or stalled stream.
 | `css_file_name_template` | `String` | `"[name].[ext]"` | Emitted asset filename template for Link-mode CSS and component assets. Tokens: `[name]`, `[hash]`, `[ext]` |
 | `css_public_base` | `Option<String>` | `None` | Public URL/path prefix for Link-mode CSS hrefs |
 | `theme` | `Option<TokenFile>` | `None` | Loaded design-token theme used to validate unresolved CSS tokens during build |
+
+Unwrapped components default to generated open Shadow roots. Set
+`DomStrategy::Light` to make unwrapped components global Light DOM; authored
+sole open Shadow roots remain Shadow in either mode. Light CSS uses ordinary
+selectors, and `:host`, `:host-context`, and `::slotted` fail with
+`unsupported-light-css`.
 
 `BuildResult::component_asset_files` contains root and shared chunk modules.
 Entry-reachable dependencies remain in the protocol and are external

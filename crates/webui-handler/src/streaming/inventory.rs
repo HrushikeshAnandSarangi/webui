@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 
+use super::error::component_style_inventory_error;
 use super::StreamingRenderState;
 use crate::{HandlerError, Result, WebUIProcessContext};
 
@@ -265,11 +266,27 @@ pub(super) fn mark_streaming_template_sent(
     Ok(true)
 }
 
+/// Mark one indexed style resource definition as delivered.
+pub(super) fn mark_streaming_style_resource_sent(
+    streaming: &mut StreamingRenderState<'_>,
+    index: u32,
+) -> Result<()> {
+    let byte_index = usize::try_from(index / 8)
+        .map_err(|_| component_style_inventory_error("component style index does not fit usize"))?;
+    if byte_index >= streaming.style_resource_inventory.len() {
+        return Err(component_style_inventory_error(
+            "component style index exceeds the request-local bitset",
+        ));
+    }
+    streaming.style_resource_inventory[byte_index] |= 1u8 << (index % 8);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::route_handler::Protocol;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use webui_protocol::{FragmentList, WebUIProtocol};
 
     #[test]
@@ -285,7 +302,7 @@ mod tests {
             Vec::new(),
         ));
         let mut streaming = StreamingRenderState::from_progress(
-            super::super::state::StreamingProgress::new(2),
+            super::super::state::StreamingProgress::new(2, 2),
             protocol.component_reachability(),
         );
         streaming.head_marker_emitted = true;
@@ -380,7 +397,7 @@ mod tests {
         );
 
         let mut streaming = StreamingRenderState::from_progress(
-            super::super::state::StreamingProgress::new(component_index.len()),
+            super::super::state::StreamingProgress::new(component_index.len(), 0),
             protocol.component_reachability(),
         );
         let state = serde_json::Value::Object(serde_json::Map::new());
@@ -401,6 +418,9 @@ mod tests {
             entry_id: "index.html",
             nonce: None,
             component_index,
+            style_resource_index: protocol.style_resource_index(),
+            style_chunk_index: protocol.protocol().style_chunk_index(),
+            css_strategy: protocol.css_strategy(),
             head_inject: None,
             body_inject: None,
             state_inject: crate::StateInject::resolve(&state),
@@ -410,9 +430,14 @@ mod tests {
             body_end_emitted: false,
             route_index: protocol.route_index(),
             route_chain_index: 0,
+            route_chain: None,
+            route_document_style_targets: Vec::new(),
+            reachable_components: None,
             streaming: Some(&mut streaming),
             json_scratch: Vec::new(),
             scope_pool: Vec::new(),
+            document_style_resources: HashSet::new(),
+            shadow_style_roots: Vec::new(),
         };
 
         record_checkpoint_tag(&mut context, "route-shell");

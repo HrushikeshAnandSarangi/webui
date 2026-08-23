@@ -180,6 +180,7 @@ impl WebUIHandler {
         options: &RenderOptions<'a>,
         writer: &'a mut W,
     ) -> Result<StreamingResponse<'a, W>> {
+        protocol.ensure_style_metadata()?;
         let core = SessionCore::new(self, protocol, options.entry_id)?;
         Ok(StreamingResponse {
             handler: self,
@@ -305,6 +306,8 @@ pub(crate) struct SessionCore {
     component_attrs: HashMap<String, Value>,
     route_base: Option<String>,
     rendered_components: HashSet<String>,
+    document_style_resources: HashSet<String>,
+    shadow_style_roots: Vec<crate::ShadowStyleRoot>,
     plugin: Option<Box<dyn HandlerPlugin>>,
     route_children: Vec<webui_protocol::WebUiFragmentRoute>,
     head_end_emitted: bool,
@@ -312,6 +315,9 @@ pub(crate) struct SessionCore {
     component_asset_styles_emitted: bool,
     body_end_emitted: bool,
     route_chain_index: usize,
+    route_chain: Option<Vec<crate::route_handler::RouteChainEntry>>,
+    route_document_style_targets: Vec<bool>,
+    reachable_components: Option<Vec<String>>,
     streaming: Option<StreamingProgress>,
     json_scratch: Vec<u8>,
     scope_pool: Vec<HashMap<String, Value>>,
@@ -343,6 +349,8 @@ impl SessionCore {
             component_attrs: HashMap::new(),
             route_base: None,
             rendered_components: HashSet::new(),
+            document_style_resources: HashSet::new(),
+            shadow_style_roots: Vec::new(),
             plugin: handler.plugin_factory.map(|factory| factory()),
             route_children: Vec::new(),
             head_end_emitted: false,
@@ -350,7 +358,13 @@ impl SessionCore {
             component_asset_styles_emitted: false,
             body_end_emitted: false,
             route_chain_index: 0,
-            streaming: Some(StreamingProgress::new(protocol.component_index().len())),
+            route_chain: None,
+            route_document_style_targets: Vec::new(),
+            reachable_components: None,
+            streaming: Some(StreamingProgress::new(
+                protocol.component_index().len(),
+                protocol.style_resource_index().len(),
+            )),
             json_scratch: Vec::new(),
             scope_pool: Vec::new(),
         })
@@ -481,6 +495,12 @@ impl SessionCore {
         self.frozen_state = state;
         match result {
             Ok(status) => {
+                if status.done && !self.shadow_style_roots.is_empty() {
+                    self.failed = true;
+                    return Err(HandlerError::Invariant(
+                        "a Shadow CSS tree escaped its component instance".to_string(),
+                    ));
+                }
                 self.done = status.done;
                 self.awaiting_advance = goal == StepGoal::CommitBoundary && !status.done;
                 Ok(status)
@@ -530,6 +550,9 @@ impl SessionCore {
             entry_id: options.entry_id,
             nonce: options.nonce.filter(|nonce| !nonce.is_empty()),
             component_index: protocol.component_index(),
+            style_resource_index: protocol.style_resource_index(),
+            style_chunk_index: protocol.protocol().style_chunk_index(),
+            css_strategy: protocol.css_strategy(),
             head_inject: options.head_inject.filter(|html| !html.is_empty()),
             body_inject: options.body_inject.filter(|html| !html.is_empty()),
             state_inject: crate::StateInject::resolve(state),
@@ -539,9 +562,14 @@ impl SessionCore {
             body_end_emitted: self.body_end_emitted,
             route_index: protocol.route_index(),
             route_chain_index: self.route_chain_index,
+            route_chain: std::mem::take(&mut self.route_chain),
+            route_document_style_targets: std::mem::take(&mut self.route_document_style_targets),
+            reachable_components: std::mem::take(&mut self.reachable_components),
             streaming: Some(&mut streaming),
             json_scratch: std::mem::take(&mut self.json_scratch),
             scope_pool: std::mem::take(&mut self.scope_pool),
+            document_style_resources: std::mem::take(&mut self.document_style_resources),
+            shadow_style_roots: std::mem::take(&mut self.shadow_style_roots),
         };
         let result = operation(&mut self.vm, &mut context);
         self.local_vars = std::mem::take(&mut context.local_vars);
@@ -558,8 +586,14 @@ impl SessionCore {
         self.component_asset_styles_emitted = context.component_asset_styles_emitted;
         self.body_end_emitted = context.body_end_emitted;
         self.route_chain_index = context.route_chain_index;
+        self.route_chain = std::mem::take(&mut context.route_chain);
+        self.route_document_style_targets =
+            std::mem::take(&mut context.route_document_style_targets);
+        self.reachable_components = std::mem::take(&mut context.reachable_components);
         self.json_scratch = std::mem::take(&mut context.json_scratch);
         self.scope_pool = std::mem::take(&mut context.scope_pool);
+        self.shadow_style_roots = std::mem::take(&mut context.shadow_style_roots);
+        self.document_style_resources = std::mem::take(&mut context.document_style_resources);
         self.streaming = Some(streaming.into_progress());
         result
     }
@@ -724,6 +758,7 @@ mod tests {
             ISLAND_TAG.to_string(),
             ComponentData {
                 template_json: r#"{"h":"<button></button>","th":1}"#.to_string(),
+                uses_shadow_dom: true,
                 hydration_mode: hydration_mode as i32,
                 hydration_keys: if matches!(hydration_mode, StateProjectionMode::Keys) {
                     vec!["count".to_string(), "title".to_string()]
@@ -733,6 +768,7 @@ mod tests {
                 ..Default::default()
             },
         );
+        document.populate_style_closures(&["index.html"]);
         Protocol::new(document)
     }
 

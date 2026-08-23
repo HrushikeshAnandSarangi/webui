@@ -327,6 +327,7 @@ fn run(args: &ServeArgs) -> Result<()> {
     output::field("Entry", &args.app_args.entry);
     output::field("Port", &args.port);
     output::field("CSS", &args.app_args.css);
+    output::field("DOM", &args.app_args.dom);
     if !args.emit_component_assets.is_empty() {
         output::field("Component assets", &args.emit_component_assets.join(", "));
     }
@@ -1268,7 +1269,7 @@ async fn handle_json_partial(
         .unwrap_or_default()
         .to_string();
 
-    // Build the complete partial response (templateStyles, templates, inventory, path, chain)
+    // Build the complete partial response (componentStyles, templates, inventory, path, chain)
     let partial = if let Some(proto) = &protocol {
         let state_json = match serde_json::to_string(&state_data) {
             Ok(value) => value,
@@ -1690,6 +1691,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -1721,6 +1723,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -1758,6 +1761,7 @@ mod tests {
                     entry: "index.html".to_string(),
                     css: CssStrategy::Link,
                     dom: DomStrategy::Shadow,
+                    css_bundle: false,
                     plugin,
                     components: Vec::new(),
                     projection_manifests: Vec::new(),
@@ -1809,6 +1813,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -1850,6 +1855,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -1878,6 +1884,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -1905,6 +1912,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -2363,6 +2371,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -2414,6 +2423,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -2712,6 +2722,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -2781,6 +2792,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -2846,6 +2858,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: None,
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -2893,6 +2906,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: Some(Plugin::WebUI),
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -2934,6 +2948,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: Some(Plugin::WebUI),
                 components: Vec::new(),
                 projection_manifests: Vec::new(),
@@ -2999,6 +3014,7 @@ mod tests {
                 entry: "index.html".to_string(),
                 css: CssStrategy::Link,
                 dom: DomStrategy::Shadow,
+                css_bundle: false,
                 plugin: Some(Plugin::WebUI),
                 components: Vec::new(),
                 projection_manifests: Vec::new(),

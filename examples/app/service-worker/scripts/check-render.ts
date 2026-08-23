@@ -70,6 +70,9 @@ while (!step.done) {
     JSON.stringify(payload.state),
   ) as WasmStreamStep;
   html += decoder.decode(step.bytes);
+  if (!html.includes('<style data-webui-resource="')) {
+    throw new Error(`Rendered boundary ${boundary.name} did not include component CSS`);
+  }
 }
 
 for (const name of apiFiles) {
