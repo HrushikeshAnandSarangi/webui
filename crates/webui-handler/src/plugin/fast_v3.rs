@@ -453,6 +453,7 @@ mod tests {
                     WebUIFragment::signal("name", false),
                     WebUIFragment::raw("</p>"),
                 ],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -473,6 +474,7 @@ mod tests {
                     WebUIFragment::signal("name", false),
                     WebUIFragment::raw("</p>"),
                 ],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -490,12 +492,14 @@ mod tests {
             "index.html".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::for_loop("item", "items", "for-1")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "for-1".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::signal("item", false)],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -519,12 +523,14 @@ mod tests {
                     ConditionExpr::identifier("show"),
                     "if-1",
                 )],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "if-1".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::raw("<p>Visible</p>")],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -555,12 +561,14 @@ mod tests {
                     WebUIFragment::component("my-comp"),
                     WebUIFragment::signal("after", false),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "my-comp".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::signal("inner", false)],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -583,6 +591,7 @@ mod tests {
                     WebUIFragment::plugin(2u32.to_le_bytes().to_vec()),
                     WebUIFragment::raw(">content</div>"),
                 ],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -618,6 +627,8 @@ mod tests {
                     WebUIFragment::component("my-component"),
                     WebUIFragment::raw("</my-component>"),
                 ],
+
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -627,6 +638,7 @@ mod tests {
                     WebUIFragment::raw("Hello "),
                     WebUIFragment::signal("name", false),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -637,6 +649,7 @@ mod tests {
                     WebUIFragment::signal("content", false),
                     WebUIFragment::raw("</span>"),
                 ],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -677,6 +690,7 @@ mod tests {
             "index.html".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::component("hydratableComponent")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -688,6 +702,7 @@ mod tests {
                     WebUIFragment::for_loop("category", "categories", "categoryTemplate"),
                     WebUIFragment::raw("</div>"),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -710,6 +725,7 @@ mod tests {
                     ),
                     WebUIFragment::raw("</section>"),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -720,6 +736,7 @@ mod tests {
                     WebUIFragment::for_loop("item", "category.items", "itemTemplate"),
                     WebUIFragment::raw("</ul>"),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -738,6 +755,7 @@ mod tests {
                     ),
                     WebUIFragment::raw("</li>"),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -747,6 +765,7 @@ mod tests {
                     WebUIFragment::raw("item-"),
                     WebUIFragment::signal("item.id", false),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -757,6 +776,7 @@ mod tests {
                     WebUIFragment::signal("item.specialText", false),
                     WebUIFragment::raw(")"),
                 ],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -842,6 +862,7 @@ mod tests {
             "index.html".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::component("my-comp")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -852,6 +873,7 @@ mod tests {
                     WebUIFragment::signal("missing_field", false),
                     WebUIFragment::raw("</p>"),
                 ],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -878,6 +900,7 @@ mod tests {
             "index.html".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::component("my-comp")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -888,12 +911,14 @@ mod tests {
                     WebUIFragment::for_loop("item", "missing_items", "loop-body"),
                     WebUIFragment::raw("</ul>"),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "loop-body".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::signal("item", false)],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -918,6 +943,7 @@ mod tests {
             "index.html".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::component("my-comp")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -928,6 +954,7 @@ mod tests {
                     WebUIFragment::signal("name", false),
                     WebUIFragment::raw("</p>"),
                 ],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -952,6 +979,7 @@ mod tests {
             "index.html".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::component("my-comp")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -962,12 +990,14 @@ mod tests {
                     WebUIFragment::for_loop("item", "items", "loop-body"),
                     WebUIFragment::raw("</ul>"),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "loop-body".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::signal("item", false)],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);

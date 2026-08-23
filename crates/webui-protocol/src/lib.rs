@@ -9,7 +9,7 @@
 //! no conversion layer between domain types and protobuf types.
 
 use prost::Message;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
 use thiserror::Error;
@@ -47,8 +47,8 @@ pub type WebUIFragmentAttribute = WebUiFragmentAttribute;
 pub type WebUIFragmentPlugin = WebUiFragmentPlugin;
 pub type WebUIFragmentRoute = WebUiFragmentRoute;
 pub type WebUIFragmentOutlet = WebUiFragmentOutlet;
+pub type WebUIFragmentBoundary = WebUiFragmentBoundary;
 pub type ComponentData = proto::ComponentData;
-pub type StreamingBoundaryList = proto::StreamingBoundaryList;
 
 /// A mapping of unique fragment identifiers to their corresponding fragment lists.
 pub type WebUIFragmentRecords = HashMap<String, FragmentList>;
@@ -211,6 +211,40 @@ impl WebUiFragment {
         }
     }
 
+    /// Create the start marker of an inline streaming boundary tape.
+    ///
+    /// The body fragments follow this marker in the same record and are closed
+    /// by [`Self::boundary_end`] carrying the same `declaration_id`.
+    pub fn boundary(
+        declaration_id: u32,
+        owner_fragment_id: impl Into<String>,
+        name: impl Into<String>,
+        key: Option<String>,
+    ) -> Self {
+        Self {
+            fragment: Some(web_ui_fragment::Fragment::Boundary(WebUiFragmentBoundary {
+                declaration_id,
+                owner_fragment_id: owner_fragment_id.into(),
+                name: name.into(),
+                key,
+                may_repeat: false,
+                phase: BoundaryPhase::Start as i32,
+            })),
+        }
+    }
+
+    /// Create the end marker that closes an inline streaming boundary tape.
+    #[must_use]
+    pub fn boundary_end(declaration_id: u32) -> Self {
+        Self {
+            fragment: Some(web_ui_fragment::Fragment::Boundary(WebUiFragmentBoundary {
+                declaration_id,
+                phase: BoundaryPhase::End as i32,
+                ..Default::default()
+            })),
+        }
+    }
+
     /// Create a simple dynamic attribute fragment (value is a single signal name).
     pub fn attribute(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
@@ -362,7 +396,6 @@ impl WebUiProtocol {
             dom_strategy: 0,
             initial_state_strategy: InitialStateStrategy::Full as i32,
             module_preloads: Vec::new(),
-            streaming_boundaries: HashMap::new(),
             component_render_css: String::new(),
             component_asset_style_preloads: Vec::new(),
         }
@@ -378,7 +411,6 @@ impl WebUiProtocol {
             dom_strategy: 0,
             initial_state_strategy: InitialStateStrategy::Full as i32,
             module_preloads: Vec::new(),
-            streaming_boundaries: HashMap::new(),
             component_render_css: String::new(),
             component_asset_style_preloads: Vec::new(),
         }
@@ -429,16 +461,14 @@ impl WebUiProtocol {
                             attr.template
                         )))
                     }
+                    Some(web_ui_fragment::Fragment::Boundary(boundary))
+                        if boundary.phase() == BoundaryPhase::Start
+                            && !fragments.contains_key(&boundary.owner_fragment_id) =>
+                    {
+                        Some(Self::missing_boundary_owner_error(boundary))
+                    }
                     Some(web_ui_fragment::Fragment::Route(route)) => {
-                        if !route.fragment_id.is_empty()
-                            && !fragments.contains_key(&route.fragment_id)
-                        {
-                            return Some(ProtocolError::Validation(format!(
-                                "Route references non-existent fragment ID: {}",
-                                route.fragment_id
-                            )));
-                        }
-                        None
+                        Self::validate_route_references(route, fragments)
                     }
                     _ => None,
                 })
@@ -448,7 +478,139 @@ impl WebUiProtocol {
             return Err(err);
         }
 
+        let mut declaration_ids = HashSet::new();
+        let mut owner_names = HashSet::new();
+        for fragment_list in fragments.values() {
+            let mut open: Option<u32> = None;
+            for fragment in &fragment_list.fragments {
+                let Some(web_ui_fragment::Fragment::Boundary(boundary)) =
+                    fragment.fragment.as_ref()
+                else {
+                    continue;
+                };
+                if boundary.phase() == BoundaryPhase::End {
+                    match open.take() {
+                        Some(declaration_id) if declaration_id == boundary.declaration_id => {}
+                        _ => return Err(Self::unbalanced_boundary_tape_error(boundary)),
+                    }
+                    continue;
+                }
+                if open.is_some() {
+                    return Err(Self::unbalanced_boundary_tape_error(boundary));
+                }
+                open = Some(boundary.declaration_id);
+                if boundary.name.trim().is_empty() {
+                    return Err(Self::empty_boundary_name_error(boundary));
+                }
+                if boundary
+                    .key
+                    .as_ref()
+                    .is_some_and(|key| key.trim().is_empty())
+                {
+                    return Err(Self::empty_boundary_key_error(boundary));
+                }
+                if !declaration_ids.insert(boundary.declaration_id) {
+                    return Err(Self::duplicate_boundary_id_error(boundary));
+                }
+                if !owner_names.insert((&boundary.owner_fragment_id, &boundary.name)) {
+                    return Err(Self::duplicate_boundary_name_error(boundary));
+                }
+            }
+            if let Some(declaration_id) = open {
+                return Err(Self::unterminated_boundary_tape_error(declaration_id));
+            }
+        }
+
         Ok(protocol)
+    }
+
+    fn validate_route_references(
+        root: &WebUiFragmentRoute,
+        fragments: &WebUIFragmentRecords,
+    ) -> Option<ProtocolError> {
+        let mut pending = vec![root];
+        while let Some(route) = pending.pop() {
+            for (kind, fragment_id) in [
+                ("component", route.fragment_id.as_str()),
+                ("content", route.content_fragment_id.as_str()),
+            ] {
+                if !fragment_id.is_empty() && !fragments.contains_key(fragment_id) {
+                    return Some(Self::missing_route_reference_error(kind, fragment_id));
+                }
+            }
+            pending.extend(route.children.iter());
+        }
+        None
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unbalanced_boundary_tape_error(boundary: &WebUiFragmentBoundary) -> ProtocolError {
+        ProtocolError::Validation(format!(
+            "Boundary declaration {} has an unbalanced inline tape marker",
+            boundary.declaration_id
+        ))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn unterminated_boundary_tape_error(declaration_id: u32) -> ProtocolError {
+        ProtocolError::Validation(format!(
+            "Boundary declaration {declaration_id} is missing its end marker"
+        ))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn missing_boundary_owner_error(boundary: &WebUiFragmentBoundary) -> ProtocolError {
+        ProtocolError::Validation(format!(
+            "Boundary declaration {} references non-existent owner fragment ID: {}",
+            boundary.declaration_id, boundary.owner_fragment_id
+        ))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn empty_boundary_name_error(boundary: &WebUiFragmentBoundary) -> ProtocolError {
+        ProtocolError::Validation(format!(
+            "Boundary declaration {} has an empty authored name",
+            boundary.declaration_id
+        ))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn empty_boundary_key_error(boundary: &WebUiFragmentBoundary) -> ProtocolError {
+        ProtocolError::Validation(format!(
+            "Boundary declaration {} has an empty key expression",
+            boundary.declaration_id
+        ))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn duplicate_boundary_id_error(boundary: &WebUiFragmentBoundary) -> ProtocolError {
+        ProtocolError::Validation(format!(
+            "Duplicate boundary declaration ID: {}",
+            boundary.declaration_id
+        ))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn duplicate_boundary_name_error(boundary: &WebUiFragmentBoundary) -> ProtocolError {
+        ProtocolError::Validation(format!(
+            "Duplicate boundary name '{}' in owner fragment '{}'",
+            boundary.name, boundary.owner_fragment_id
+        ))
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn missing_route_reference_error(kind: &str, fragment_id: &str) -> ProtocolError {
+        ProtocolError::Validation(format!(
+            "Route {kind} references non-existent fragment ID: {fragment_id}"
+        ))
     }
 
     /// Serialize protocol to pretty JSON (for debug/inspect output only).
@@ -501,18 +663,21 @@ mod tests {
                     WebUIFragment::signal("description", true),
                     WebUIFragment::if_cond(ConditionExpr::identifier("contact"), "if-1"),
                 ],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "for-1".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::signal("person.name", false)],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "if-1".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::component("contact-card")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
@@ -522,6 +687,7 @@ mod tests {
                     WebUIFragment::raw("Hello, "),
                     WebUIFragment::signal("name", false),
                 ],
+                contains_boundary: false,
             },
         );
         WebUIProtocol::new(fragments)
@@ -590,27 +756,88 @@ mod tests {
     }
 
     #[test]
-    fn test_protobuf_streaming_boundary_names_roundtrip_in_declaration_order() {
+    fn test_protobuf_boundary_fragment_roundtrip() {
         let mut protocol = sample_protocol();
-        protocol.streaming_boundaries.insert(
-            "main".to_string(),
-            StreamingBoundaryList {
-                names: vec![
-                    "weather shell".to_string(),
-                    "composer/ready".to_string(),
-                    "feed:batch".to_string(),
-                ],
-            },
-        );
+        let main = protocol
+            .fragments
+            .get_mut("index.html")
+            .expect("sample entry exists");
+        main.fragments.push(WebUIFragment::boundary(
+            7,
+            "index.html",
+            "weather shell",
+            Some("forecast.id".to_string()),
+        ));
+        main.fragments
+            .push(WebUIFragment::raw("<weather-panel></weather-panel>"));
+        main.fragments.push(WebUIFragment::boundary_end(7));
+        main.contains_boundary = true;
 
         let bytes = protocol.to_protobuf().expect("encode failed");
         let decoded = WebUIProtocol::from_protobuf(&bytes).expect("decode failed");
 
-        assert_eq!(
-            decoded.streaming_boundaries["main"].names,
-            protocol.streaming_boundaries["main"].names
-        );
+        let markers: Vec<&WebUiFragmentBoundary> = decoded.fragments["index.html"]
+            .fragments
+            .iter()
+            .filter_map(|fragment| match fragment.fragment.as_ref() {
+                Some(web_ui_fragment::Fragment::Boundary(boundary)) => Some(boundary),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(markers.len(), 2, "the tape survives roundtrip as a pair");
+        let boundary = markers[0];
+        assert_eq!(boundary.phase(), BoundaryPhase::Start);
+        assert_eq!(boundary.declaration_id, 7);
+        assert_eq!(boundary.owner_fragment_id, "index.html");
+        assert_eq!(boundary.name, "weather shell");
+        assert_eq!(boundary.key.as_deref(), Some("forecast.id"));
+        assert_eq!(markers[1].phase(), BoundaryPhase::End);
+        assert_eq!(markers[1].declaration_id, 7);
+        assert!(decoded.fragments["index.html"].contains_boundary);
         assert_eq!(protocol, decoded);
+    }
+
+    #[test]
+    fn test_protocol_rejects_unbalanced_boundary_tape() {
+        let tape_cases: [(&str, Vec<WebUIFragment>); 3] = [
+            (
+                "start without end",
+                vec![WebUIFragment::boundary(0, "index.html", "ready", None)],
+            ),
+            ("end without start", vec![WebUIFragment::boundary_end(0)]),
+            (
+                "nested start",
+                vec![
+                    WebUIFragment::boundary(0, "index.html", "outer", None),
+                    WebUIFragment::boundary(1, "index.html", "inner", None),
+                    WebUIFragment::boundary_end(1),
+                    WebUIFragment::boundary_end(0),
+                ],
+            ),
+        ];
+        for (label, fragments) in tape_cases {
+            let protocol = WebUIProtocol::new(HashMap::from([(
+                "index.html".to_string(),
+                FragmentList {
+                    fragments,
+                    contains_boundary: true,
+                },
+            )]));
+            let bytes = protocol.to_protobuf().expect("encode failed");
+            let error =
+                WebUIProtocol::from_protobuf(&bytes).expect_err("unbalanced tape must be rejected");
+            assert!(
+                error.to_string().contains("Boundary"),
+                "{label}: unexpected error {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_protocol_has_no_fixed_streaming_boundary_table() {
+        let json = sample_protocol().to_json_pretty().expect("serialize JSON");
+        assert!(!json.contains("streaming_boundaries"));
+        assert!(!json.contains("StreamingBoundaryList"));
     }
 
     #[test]
@@ -628,25 +855,38 @@ mod tests {
                         ConditionExpr::predicate("a", ComparisonOperator::GreaterThan, "1"),
                         "cond",
                     ),
+                    WebUIFragment::boundary(0, "main", "ready", None),
+                    WebUIFragment::boundary_end(0),
                 ],
+                contains_boundary: true,
             },
         );
         fragments.insert(
             "comp".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::raw("c")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "loop".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::raw("l")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "cond".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::raw("i")],
+                contains_boundary: false,
+            },
+        );
+        fragments.insert(
+            "boundary".to_string(),
+            FragmentList {
+                fragments: vec![WebUIFragment::raw("b")],
+                contains_boundary: false,
             },
         );
 
@@ -675,12 +915,14 @@ mod tests {
                         ConditionExpr::predicate("a", *op, "b"),
                         "then",
                     )],
+                    contains_boundary: false,
                 },
             );
             fragments.insert(
                 "then".to_string(),
                 FragmentList {
                     fragments: vec![WebUIFragment::raw("ok")],
+                    contains_boundary: false,
                 },
             );
             let p = WebUIProtocol::new(fragments);
@@ -707,12 +949,14 @@ mod tests {
             "main".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::if_cond(nested, "then")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "then".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::raw("ok")],
+                contains_boundary: false,
             },
         );
         let p = WebUIProtocol::new(fragments);
@@ -734,12 +978,14 @@ mod tests {
             "main".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::if_cond(compound, "body")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "body".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::raw("yes")],
+                contains_boundary: false,
             },
         );
         let p = WebUIProtocol::new(fragments);
@@ -782,6 +1028,7 @@ mod tests {
             "main".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::component("does-not-exist")],
+                contains_boundary: false,
             },
         );
 
@@ -799,6 +1046,7 @@ mod tests {
             "main".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::for_loop("item", "items", "missing-for")],
+                contains_boundary: false,
             },
         );
 
@@ -822,6 +1070,7 @@ mod tests {
                     ConditionExpr::identifier("flag"),
                     "missing-if",
                 )],
+                contains_boundary: false,
             },
         );
 
@@ -842,6 +1091,7 @@ mod tests {
             "main".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::signal("name", false)],
+                contains_boundary: false,
             },
         );
         let p = WebUIProtocol::new(fragments);
@@ -931,12 +1181,14 @@ mod tests {
             "main".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::route("/profile/:id", "profile-page")],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "profile-page".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::raw("<h1>Profile</h1>")],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -969,18 +1221,21 @@ mod tests {
                 invalidates: vec!["posts".to_string(), "counts".to_string()],
                 pending_component: "loading-skeleton".to_string(),
                 error_component: "error-page".to_string(),
+                content_fragment_id: String::new(),
             })),
         };
         fragments.insert(
             "main".to_string(),
             FragmentList {
                 fragments: vec![route_frag],
+                contains_boundary: false,
             },
         );
         fragments.insert(
             "user-posts".into(),
             FragmentList {
                 fragments: vec![WebUIFragment::raw("posts")],
+                contains_boundary: false,
             },
         );
 
@@ -997,6 +1252,7 @@ mod tests {
             "main".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::route("/test", "missing-fragment")],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -1022,6 +1278,7 @@ mod tests {
             "main".to_string(),
             FragmentList {
                 fragments: vec![route_frag],
+                contains_boundary: false,
             },
         );
         let protocol = WebUIProtocol::new(fragments);
@@ -1046,6 +1303,7 @@ mod tests {
             "index.html".to_string(),
             FragmentList {
                 fragments: vec![WebUIFragment::raw("Hello")],
+                contains_boundary: false,
             },
         );
         let tokens = vec!["border-radius-m".to_string(), "color-primary".to_string()];
