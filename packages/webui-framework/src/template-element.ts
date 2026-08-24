@@ -169,6 +169,34 @@ const RAW_MARKER_BOUNDARY_BASE = 0x40000000;
  */
 const tplElementCache = new WeakMap<Node, Array<Node | undefined>>();
 
+interface PendingSlot {
+  parent: Node;
+  before: Node | null;
+  order: number;
+  node: Node;
+  end?: Comment;
+}
+
+function comparePendingSlots(left: PendingSlot, right: PendingSlot): number {
+  return left.order - right.order;
+}
+
+function insertPendingSlots(
+  slots: PendingSlot[],
+  count: number,
+  needsOrdering: boolean,
+): void {
+  if (needsOrdering) {
+    slots.length = count;
+    slots.sort(comparePendingSlots);
+  }
+  for (let i = 0; i < count; i++) {
+    const slot = slots[i];
+    slot.parent.insertBefore(slot.node, slot.before);
+    if (slot.end) slot.parent.insertBefore(slot.end, slot.before);
+  }
+}
+
 function getTemplateElements(tplRoot: Node): Array<Node | undefined> {
   let cached = tplElementCache.get(tplRoot);
   if (!cached) {
@@ -1748,63 +1776,103 @@ export class TemplateElement extends HTMLElement {
     // pre-order reproduces the indices the compiler assigned.
     const elements = collectTemplateElements(root);
 
-    // Pre-resolve text binding slots
-    const textRefs = new Array<{ parent: Node; ref: Node | null; parts: CompiledAttrPart[]; raw?: boolean }>(meta.tx?.length ?? 0);
-    let textRefCount = 0;
+    const pendingSlots = new Array<PendingSlot>(
+      (meta.tx?.length ?? 0) + (meta.c?.length ?? 0) + (meta.r?.length ?? 0),
+    );
+    let pendingSlotCount = 0;
+    let needsSlotOrdering = false;
+
+    // Text bindings: create direct nodes and queue their compiled placement.
+    let rawIndex = 0;
     if (meta.tx) {
       for (let i = 0; i < meta.tx.length; i++) {
         const entry = meta.tx[i];
         const [slot, parts] = entry;
         const raw = entry[2] === 1;
-        const [parentIndex, beforeIndex] = slot;
+        const [parentIndex, beforeIndex, order = 0] = slot;
         const parent = elements[parentIndex];
         if (!parent || (parent.nodeType !== 1 && parent.nodeType !== 11)) continue;
-        textRefs[textRefCount] = { parent, ref: parent.childNodes[beforeIndex] || null, parts, raw };
-        textRefCount += 1;
+        let node: Node;
+        let end: Comment | undefined;
+        if (raw) {
+          const start = document.createComment(rawMarker(rawIndex));
+          end = document.createComment(rawMarker(rawIndex, true));
+          rawIndex++;
+          instance.texts.push({
+            node: start,
+            parts,
+            scope,
+            raw: true,
+            rawEnd: end,
+            rawOwner: instance,
+          });
+          node = start;
+        } else {
+          const textNode = document.createTextNode('');
+          instance.texts.push({ node: textNode, parts, scope });
+          node = textNode;
+        }
+        pendingSlots[pendingSlotCount++] = {
+          parent,
+          before: parent.childNodes[beforeIndex] || null,
+          order,
+          node,
+          end,
+        };
+        if (order > 0) needsSlotOrdering = true;
       }
     }
 
-    // Pre-resolve conditional slots
-    type CondRef = { parent: Node; ref: Node | null; condition: CompiledCondition; blockIndex: number };
-    const condRefs = new Array<CondRef>(meta.c?.length ?? 0);
-    let condRefCount = 0;
+    // Conditional bindings: create stable anchors and queue their placement.
     if (meta.c) {
       for (let i = 0; i < meta.c.length; i++) {
         const [condition, blockIndex, slotMeta] = meta.c[i];
-        const [parentIndex, beforeIndex] = slotMeta;
+        const [parentIndex, beforeIndex, order = 0] = slotMeta;
         const parent = elements[parentIndex];
         if (!parent || (parent.nodeType !== 1 && parent.nodeType !== 11)) continue;
-        condRefs[condRefCount] = { parent, ref: parent.childNodes[beforeIndex] || null, condition: condition as CompiledCondition, blockIndex };
-        condRefCount += 1;
+        const anchor = document.createComment('');
+        instance.conds.push({
+          condition: condition as CompiledCondition,
+          blockIndex,
+          anchor,
+          scope,
+          owner: instance,
+          instance: null,
+        });
+        pendingSlots[pendingSlotCount++] = {
+          parent,
+          before: parent.childNodes[beforeIndex] || null,
+          order,
+          node: anchor,
+        };
+        if (order > 0) needsSlotOrdering = true;
       }
     }
 
-    // Pre-resolve repeat slots
-    type RepRef = {
-      parent: Node;
-      ref: Node | null;
-      collection: string;
-      itemVar: string;
-      blockIndex: number;
-      keyPath?: string;
-    };
-    const repRefs = new Array<RepRef>(meta.r?.length ?? 0);
-    let repRefCount = 0;
+    // Repeat bindings: create stable anchors and queue their placement.
     if (meta.r) {
       for (let i = 0; i < meta.r.length; i++) {
         const [collection, itemVar, blockIndex, slotMeta, keyPath] = meta.r[i];
-        const [parentIndex, beforeIndex] = slotMeta;
+        const [parentIndex, beforeIndex, order = 0] = slotMeta;
         const parent = elements[parentIndex];
         if (!parent || (parent.nodeType !== 1 && parent.nodeType !== 11)) continue;
-        repRefs[repRefCount] = {
-          parent,
-          ref: parent.childNodes[beforeIndex] || null,
-          collection,
-          itemVar,
-          blockIndex,
-          keyPath,
+        const anchor = document.createComment('');
+        const binding: RepeatBinding = {
+          markerId: i, collection, itemVar, blockIndex,
+          container: parent as ParentNode & Node, start: anchor, end: null,
+          scope, owner: instance, instances: [],
         };
-        repRefCount += 1;
+        if (keyPath !== undefined) {
+          binding.keyState = createRepeatKeyState(keyPath);
+        }
+        instance.repeats.push(binding);
+        pendingSlots[pendingSlotCount++] = {
+          parent,
+          before: parent.childNodes[beforeIndex] || null,
+          order,
+          node: anchor,
+        };
+        if (order > 0) needsSlotOrdering = true;
       }
     }
 
@@ -1816,66 +1884,12 @@ export class TemplateElement extends HTMLElement {
     // insertions still shift childNode indices for sibling elements.
     this.$finalize(instance, root, meta, (_r, i) => elements[i] ?? null, scope);
 
-    // Now insert anchors using pre-resolved references
+    // Co-located slots share one static insertion reference. Commit them only
+    // after every reference has been captured from the untouched DOM.
+    insertPendingSlots(pendingSlots, pendingSlotCount, needsSlotOrdering);
 
-    // Text bindings
-    let rawIndex = 0;
-    for (let i = 0; i < textRefCount; i++) {
-      const t = textRefs[i];
-      const anchor = document.createComment(t.raw ? rawMarker(rawIndex, true) : '');
-      t.parent.insertBefore(anchor, t.ref);
-      if (t.raw) {
-        const start = document.createComment(rawMarker(rawIndex));
-        rawIndex++;
-        t.parent.insertBefore(start, anchor);
-        instance.texts.push({
-          node: start,
-          parts: t.parts,
-          scope,
-          raw: true,
-          rawEnd: anchor,
-          rawOwner: instance,
-        });
-      } else {
-        const textNode = document.createTextNode('');
-        t.parent.insertBefore(textNode, anchor);
-        instance.texts.push({ node: textNode, parts: t.parts, scope });
-      }
-    }
-
-    // Conditional bindings
-    for (let i = 0; i < condRefCount; i++) {
-      const c = condRefs[i];
-      const anchor = document.createComment('');
-      c.parent.insertBefore(anchor, c.ref);
-      instance.conds.push({
-        condition: c.condition,
-        blockIndex: c.blockIndex,
-        anchor,
-        scope,
-        owner: instance,
-        instance: null,
-      });
-    }
-
-    // Repeat bindings
-    for (let i = 0; i < repRefCount; i++) {
-      const r = repRefs[i];
-      const anchor = document.createComment('');
-      r.parent.insertBefore(anchor, r.ref);
-      const binding: RepeatBinding = {
-        markerId: i, collection: r.collection, itemVar: r.itemVar, blockIndex: r.blockIndex,
-        container: r.parent as ParentNode & Node, start: anchor, end: null,
-        scope, owner: instance, instances: [],
-      };
-      if (r.keyPath !== undefined) {
-        binding.keyState = createRepeatKeyState(r.keyPath);
-      }
-      instance.repeats.push(binding);
-    }
-
-    // Evaluate conditionals and repeats inline so blocks are created
-    // immediately — no deferred $update() flush needed.
+    // Create conditional blocks immediately; the first full binding pass
+    // reconciles repeats after this wiring step returns.
     for (let i = 0; i < instance.conds.length; i++) this.$toggleCond(instance.conds[i]);
 
     return instance;
