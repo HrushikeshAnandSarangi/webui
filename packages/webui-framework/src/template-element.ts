@@ -326,6 +326,15 @@ function queuePendingParentState(
   }
 }
 
+/** Internal seam for compiler-owned hosts defined after a parent state write. */
+export function consumePendingParentState(
+  element: Element,
+): PendingParentState | undefined {
+  const pending = pendingParentStateByElement.get(element);
+  if (pending) pendingParentStateByElement.delete(element);
+  return pending;
+}
+
 function isUnupgradedWebUITarget(element: Element): boolean {
   const tagName = element.localName;
   if (tagName.indexOf('-') === -1) return false;
@@ -1529,9 +1538,8 @@ export class TemplateElement extends HTMLElement {
    * walks its own bindings. Parent values override page-wide bootstrap keys.
    */
   private $applyPendingParentState(replayAfterHydration: boolean): void {
-    const pending = pendingParentStateByElement.get(this);
+    const pending = consumePendingParentState(this);
     if (!pending) return;
-    pendingParentStateByElement.delete(this);
 
     const state = pending.values;
     const observableNames = this.$observableNames();

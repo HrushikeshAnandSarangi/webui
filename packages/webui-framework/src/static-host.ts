@@ -11,9 +11,19 @@
  * immediately because they have no server-rendered DOM to preserve.
  */
 
-import { TemplateElement } from './template-element.js';
+import {
+  consumePendingParentState,
+  TemplateElement,
+} from './template-element.js';
+import { hasComponentStyleWork } from './element/styles.js';
 import { getTemplateRegistry } from './template.js';
 import { templateNeedsStaticHost } from './template-roots.js';
+import {
+  ACTIVATION_STATIC_HOST_OPT_OUT,
+  isStreamingHydrationMode,
+  STREAMED_HOST_ATTR,
+  STREAMING_BOUNDARY_ACTIVATE,
+} from './streaming-mode.js';
 import {
   TEMPLATES_REGISTERED_EVENT,
   templateRegistrationDetail,
@@ -22,12 +32,48 @@ import type { TemplateMeta } from './template.js';
 
 let runtimeInstalled = false;
 
+// Static hosts are defined in a later task, so parent `:` writes can arrive
+// first. The WeakMap keeps hosts with no queued writes field-free.
+function applyPendingNoopHostState(host: HTMLElement): void {
+  const pending = consumePendingParentState(host);
+  if (!pending) return;
+  const target = host as unknown as Record<string, unknown>;
+  const keys = Object.keys(pending.values);
+  for (let i = 0; i < keys.length; i++) {
+    const key = keys[i];
+    if (!Object.hasOwn(target, key)) target[key] = pending.values[key];
+  }
+}
+
 /** Define the smallest client-rendering element for a compiler-owned template. */
 function defineTemplateHost(tag: string, meta: TemplateMeta): void {
   const w = window as Window;
   if (!w.__webui) w.__webui = {};
   if (!w.__webui.templates) w.__webui.templates = {};
   if (!w.__webui.templates[tag]) w.__webui.templates[tag] = meta;
+
+  if (templateIsNoopHost(meta) && !hasComponentStyleWork(tag)) {
+    // Prototype-only behavior avoids TemplateElement's per-instance state.
+    customElements.define(tag, class extends HTMLElement {
+      connectedCallback(): void {
+        // Preserve streamed deferral before a queued property can shadow
+        // hasAttribute(). Ordinary data-ws attributes remain author-owned.
+        if (
+          isStreamingHydrationMode() &&
+          this.hasAttribute(STREAMED_HOST_ATTR)
+        ) {
+          return;
+        }
+        applyPendingNoopHostState(this);
+      }
+
+      [STREAMING_BOUNDARY_ACTIVATE](): typeof ACTIVATION_STATIC_HOST_OPT_OUT {
+        applyPendingNoopHostState(this);
+        return ACTIVATION_STATIC_HOST_OPT_OUT;
+      }
+    });
+    return;
+  }
 
   class StaticTemplateHost extends TemplateElement {
     protected $afterExternalStateWrite(applied: boolean): void {
@@ -51,6 +97,20 @@ function defineTemplateHost(tag: string, meta: TemplateMeta): void {
   }
 
   StaticTemplateHost.define(tag);
+}
+
+/** Whether metadata proves there is no DOM or reactive work. */
+function templateIsNoopHost(meta: TemplateMeta): boolean {
+  return meta.h.length === 0
+    && meta.tx === undefined
+    && meta.a === undefined
+    && meta.c === undefined
+    && meta.r === undefined
+    && meta.eg === undefined
+    && meta.b === undefined
+    && meta.re === undefined
+    && meta.tr === undefined
+    && meta.sd === undefined;
 }
 
 /** Define a dormant host for one compiler-owned template tag when safe. */
