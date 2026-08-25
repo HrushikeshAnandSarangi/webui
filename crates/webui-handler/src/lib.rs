@@ -42,7 +42,9 @@ use serde::ser::SerializeMap;
 use serde::Serialize;
 use serde_json::Value;
 use std::borrow::Cow;
+use std::cell::{Cell, OnceCell};
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use streaming::{
     consume_streaming_component_root, ensure_no_pending_streaming_root,
     prepare_generated_streaming_root, record_checkpoint_tag, streaming_template_already_sent,
@@ -57,7 +59,7 @@ pub use streaming::{
 use thiserror::Error;
 use webui_expressions::{evaluate_with_resolver, ExpressionError};
 use webui_protocol::{
-    web_ui_fragment::Fragment, ComponentAssetStylePreload, InitialStateStrategy,
+    web_ui_fragment::Fragment, ComponentAssetStylePreload, FragmentList, InitialStateStrategy,
     StateProjectionMode, WebUIFragment, WebUIProtocol,
 };
 use webui_state::find_value_by_dotted_path_ref;
@@ -427,9 +429,391 @@ pub(crate) struct ShadowStyleRoot {
     routed_resources: Vec<u32>,
 }
 
+struct LoopBinding<'protocol, 'state> {
+    name: &'protocol str,
+    value: &'state Value,
+}
+
+#[derive(Clone, Copy)]
+struct VisibleLoopScope {
+    start: usize,
+    end: usize,
+}
+
+impl VisibleLoopScope {
+    const EMPTY: Self = Self { start: 0, end: 0 };
+}
+
+#[derive(Clone, Copy)]
+struct LocalValueSources<'ctx, 'protocol, 'state> {
+    owned: &'ctx HashMap<String, Value>,
+    borrowed: &'ctx BorrowedScope<'protocol, 'state>,
+}
+
+#[derive(Default)]
+struct BorrowedScope<'protocol, 'state> {
+    inline: [Option<(&'protocol str, &'state Value)>; INLINE_SCOPE_SLOTS],
+    inline_len: usize,
+    overflow: Vec<(&'protocol str, &'state Value)>,
+}
+
+impl<'protocol, 'state> BorrowedScope<'protocol, 'state> {
+    fn get(&self, name: &str) -> Option<&'state Value> {
+        if self.inline_len == 0 {
+            return None;
+        }
+        if let Some((entry_name, value)) = self.inline[0].as_ref() {
+            if *entry_name == name {
+                return Some(*value);
+            }
+        }
+        for (entry_name, value) in self.inline[1..self.inline_len].iter().flatten() {
+            if *entry_name == name {
+                return Some(*value);
+            }
+        }
+        self.overflow
+            .iter()
+            .find_map(|(entry_name, value)| (*entry_name == name).then_some(*value))
+    }
+
+    fn insert(&mut self, name: &'protocol str, value: &'state Value) -> Option<&'state Value> {
+        for (entry_name, current) in self.inline[..self.inline_len].iter_mut().flatten() {
+            if *entry_name == name {
+                return Some(std::mem::replace(current, value));
+            }
+        }
+        for (entry_name, current) in &mut self.overflow {
+            if *entry_name == name {
+                return Some(std::mem::replace(current, value));
+            }
+        }
+        if self.inline_len < INLINE_SCOPE_SLOTS {
+            self.inline[self.inline_len] = Some((name, value));
+            self.inline_len += 1;
+        } else {
+            self.overflow.push((name, value));
+        }
+        None
+    }
+
+    fn remove(&mut self, name: &str) -> Option<&'state Value> {
+        if let Some(index) = self.inline[..self.inline_len].iter().position(|entry| {
+            entry
+                .as_ref()
+                .is_some_and(|(entry_name, _)| *entry_name == name)
+        }) {
+            let removed = self.inline[index].take().map(|(_, value)| value);
+            if let Some(entry) = self.overflow.pop() {
+                self.inline[index] = Some(entry);
+            } else {
+                self.inline_len -= 1;
+                self.inline[index] = self.inline[self.inline_len].take();
+            }
+            return removed;
+        }
+        let index = self
+            .overflow
+            .iter()
+            .position(|(entry_name, _)| *entry_name == name)?;
+        Some(self.overflow.swap_remove(index).1)
+    }
+
+    fn clear(&mut self) {
+        for entry in &mut self.inline[..self.inline_len] {
+            *entry = None;
+        }
+        self.inline_len = 0;
+        self.overflow.clear();
+    }
+
+    fn clone_into_owned(&self, target: &mut HashMap<String, Value>) {
+        for (name, value) in self.inline[..self.inline_len].iter().flatten() {
+            target.insert((*name).to_owned(), (*value).clone());
+        }
+        for (name, value) in &self.overflow {
+            target.insert((*name).to_owned(), (*value).clone());
+        }
+    }
+}
+
+/// A fragment list paired with the render metadata prepared for it when the
+/// runtime [`Protocol`] was loaded.
+///
+/// `fragments` still points at the protocol's own storage, so passing this by
+/// value never copies or clones a fragment graph.
+#[derive(Clone, Copy)]
+pub(crate) struct RenderFragmentList<'protocol> {
+    fragments: &'protocol [WebUIFragment],
+    metadata: &'protocol [RenderFragmentMetadata],
+    attr_names: &'protocol str,
+    /// True when this list contains at least one `<webui-route>` fragment.
+    /// Renders skip the sibling route pre-scan entirely when it is false.
+    has_routes: bool,
+}
+
+impl<'protocol> RenderFragmentList<'protocol> {
+    /// Render slot the fragment at `index` descends into, if any.
+    fn target(self, index: usize) -> Option<usize> {
+        let target = self.metadata.get(index)?.target;
+        (target != NO_RENDER_SLOT).then_some(target as usize)
+    }
+
+    /// Canonical camelCase component prop name prepared for an attribute fragment.
+    fn component_attr_name(self, index: usize) -> Option<&'protocol str> {
+        let prepared = self.metadata.get(index)?;
+        if prepared.attr_start == NO_ATTR_NAME {
+            return None;
+        }
+        let start = prepared.attr_start as usize;
+        self.attr_names
+            .get(start..start + prepared.attr_len as usize)
+    }
+}
+
+/// Sentinel for "this fragment does not descend into another fragment list".
+const NO_RENDER_SLOT: u32 = u32::MAX;
+/// Sentinel for "this fragment is not an attribute fragment".
+const NO_ATTR_NAME: u32 = u32::MAX;
+
+/// Per-fragment values hoisted out of the render loop at protocol load time.
+///
+/// Deliberately a flat 12-byte `Copy` record with no owned allocations: a large
+/// protocol keeps one contiguous arena instead of one heap block per fragment.
+#[derive(Clone, Copy)]
+struct RenderFragmentMetadata {
+    /// Numeric slot of the fragment list this fragment renders into, avoiding a
+    /// string hash lookup per component, loop, condition, and template attribute.
+    /// [`NO_RENDER_SLOT`] when the fragment renders inline.
+    target: u32,
+    /// Offset into the index's shared attribute-name arena, or [`NO_ATTR_NAME`].
+    attr_start: u32,
+    attr_len: u32,
+}
+
+/// Build-time render plan for every fragment list in a protocol.
+///
+/// Built once when a [`Protocol`] is created and shared immutably by every
+/// render. Fragment IDs are the same `Arc<str>` values the protocol already
+/// interns, metadata lives in one flat arena, and the fragment graphs
+/// themselves are never duplicated.
+pub(crate) struct RenderFragmentIndex {
+    ids: Box<[Arc<str>]>,
+    metadata: Box<[RenderFragmentMetadata]>,
+    /// Prefix offsets into `metadata`; length is `ids.len() + 1`.
+    ranges: Box<[u32]>,
+    /// Every prepared component prop name concatenated into one allocation.
+    attr_names: Box<str>,
+    /// One bit per fragment list: does it contain a route fragment?
+    route_presence: Box<[u64]>,
+}
+
+/// A [`RenderFragmentIndex`] bound to the protocol document for one render.
+///
+/// Fragment lists are borrowed lazily and memoized in an inline slot cache, so
+/// a large protocol is never eagerly walked to serve a small render.
+pub(crate) struct ResolvedRenderFragmentIndex<'protocol> {
+    cache: [Cell<Option<&'protocol FragmentList>>; INLINE_RENDER_FRAGMENT_LISTS],
+    /// Memo slots for protocols with more fragment lists than the inline cache
+    /// holds, allocated on first use so a small render never pays for it and a
+    /// large one never falls back to hashing the fragment ID on every descent.
+    spilled: OnceCell<Box<[Cell<Option<&'protocol FragmentList>>]>>,
+    index: &'protocol RenderFragmentIndex,
+    protocol: &'protocol WebUIProtocol,
+}
+
+impl RenderFragmentIndex {
+    /// Prepare the render plan for `protocol`.
+    ///
+    /// `ids` must be the protocol's sorted fragment IDs and `slots` its ID→slot
+    /// map, so render slots and the runtime [`Protocol`]'s continuation slots are
+    /// the same numbering. Reusing the map keeps preparation to one hash lookup
+    /// per reference instead of a string binary search.
+    pub(crate) fn new(
+        protocol: &WebUIProtocol,
+        ids: &[Arc<str>],
+        slots: &HashMap<Arc<str>, u32>,
+    ) -> Self {
+        let total_fragments = protocol
+            .fragments
+            .values()
+            .map(|list| list.fragments.len())
+            .sum();
+        let mut metadata = Vec::with_capacity(total_fragments);
+        let mut ranges = Vec::with_capacity(ids.len() + 1);
+        // Most attribute names are short; reserving up front keeps the shared
+        // arena from repeatedly reallocating and copying as it is filled.
+        let mut attr_names = String::with_capacity(total_fragments * 8);
+        let mut route_presence = vec![0u64; ids.len().div_ceil(64)];
+
+        for (slot, id) in ids.iter().enumerate() {
+            // Record counts are bounded by the compiled graph, well inside u32.
+            #[allow(clippy::cast_possible_truncation)]
+            ranges.push(metadata.len() as u32);
+            let Some(list) = protocol.fragments.get(id.as_ref()) else {
+                continue;
+            };
+            let mut has_routes = false;
+            for fragment in &list.fragments {
+                let inner = fragment.fragment.as_ref();
+                if matches!(inner, Some(Fragment::Route(_))) {
+                    has_routes = true;
+                }
+                let target = fragment_target_id(fragment)
+                    .and_then(|target| slots.get(target).copied())
+                    .unwrap_or(NO_RENDER_SLOT);
+                let (attr_start, attr_len) = match inner {
+                    // `attr_skip` attributes are never collected into component
+                    // props, so preparing a name for them would be pure load-time
+                    // cost for something no render ever reads.
+                    Some(Fragment::Attribute(attribute)) if !attribute.attr_skip => {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let start = attr_names.len() as u32;
+                        let before = attr_names.len();
+                        push_component_attr_name(&mut attr_names, component_attr_source(attribute));
+                        #[allow(clippy::cast_possible_truncation)]
+                        let len = (attr_names.len() - before) as u32;
+                        (start, len)
+                    }
+                    _ => (NO_ATTR_NAME, 0),
+                };
+                metadata.push(RenderFragmentMetadata {
+                    target,
+                    attr_start,
+                    attr_len,
+                });
+            }
+            if has_routes {
+                route_presence[slot / 64] |= 1u64 << (slot % 64);
+            }
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        ranges.push(metadata.len() as u32);
+
+        Self {
+            ids: ids.to_vec().into_boxed_slice(),
+            metadata: metadata.into_boxed_slice(),
+            ranges: ranges.into_boxed_slice(),
+            attr_names: attr_names.into_boxed_str(),
+            route_presence: route_presence.into_boxed_slice(),
+        }
+    }
+
+    /// Resolve a fragment ID to its stable numeric render slot.
+    pub(crate) fn index(&self, id: &str) -> Option<usize> {
+        self.ids
+            .binary_search_by(|candidate| candidate.as_ref().cmp(id))
+            .ok()
+    }
+
+    pub(crate) fn resolve<'protocol>(
+        &'protocol self,
+        protocol: &'protocol WebUIProtocol,
+    ) -> ResolvedRenderFragmentIndex<'protocol> {
+        ResolvedRenderFragmentIndex {
+            cache: std::array::from_fn(|_| Cell::new(None)),
+            spilled: OnceCell::new(),
+            index: self,
+            protocol,
+        }
+    }
+}
+
+impl<'protocol> ResolvedRenderFragmentIndex<'protocol> {
+    pub(crate) fn index(&self, id: &str) -> Option<usize> {
+        self.index.index(id)
+    }
+
+    /// Memo slot for `index`, spilling past the inline cache on demand.
+    fn slot(&self, index: usize) -> Option<&Cell<Option<&'protocol FragmentList>>> {
+        if index < INLINE_RENDER_FRAGMENT_LISTS {
+            return self.cache.get(index);
+        }
+        let spilled = self.spilled.get_or_init(|| {
+            let overflow = self
+                .index
+                .ids
+                .len()
+                .saturating_sub(INLINE_RENDER_FRAGMENT_LISTS);
+            (0..overflow).map(|_| Cell::new(None)).collect()
+        });
+        spilled.get(index - INLINE_RENDER_FRAGMENT_LISTS)
+    }
+
+    pub(crate) fn list(&self, index: usize) -> Option<RenderFragmentList<'protocol>> {
+        let id = self.index.ids.get(index)?;
+        let fragment_list = match self.slot(index) {
+            Some(slot) => match slot.get() {
+                Some(cached) => cached,
+                None => {
+                    let resolved = self.protocol.fragments.get(id.as_ref())?;
+                    slot.set(Some(resolved));
+                    resolved
+                }
+            },
+            None => self.protocol.fragments.get(id.as_ref())?,
+        };
+        let start = *self.index.ranges.get(index)? as usize;
+        let end = *self.index.ranges.get(index + 1)? as usize;
+        let metadata = self.index.metadata.get(start..end)?;
+        let has_routes = self
+            .index
+            .route_presence
+            .get(index / 64)
+            .is_some_and(|word| word & (1u64 << (index % 64)) != 0);
+        Some(RenderFragmentList {
+            fragments: &fragment_list.fragments,
+            metadata,
+            attr_names: &self.index.attr_names,
+            has_routes,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn list_by_id(&self, id: &str) -> Option<RenderFragmentList<'protocol>> {
+        self.index(id).and_then(|index| self.list(index))
+    }
+}
+
+/// Name that a component prop is derived from for an attribute fragment.
+///
+/// The render path strips a leading `:` twice on the complex-value branch and
+/// once on every other branch. Every field that selects the branch is a
+/// build-time constant, so the choice is made here and the prepared name stays
+/// byte-identical to the per-render conversion it replaces.
+fn component_attr_source(attribute: &webui_protocol::WebUIFragmentAttribute) -> &str {
+    let takes_complex_branch = attribute.condition_tree.is_none()
+        && attribute.template.is_empty()
+        && !attribute.value.is_empty()
+        && !attribute.raw_value
+        && attribute.complex;
+    if takes_complex_branch {
+        attribute.name.strip_prefix(':').unwrap_or(&attribute.name)
+    } else {
+        &attribute.name
+    }
+}
+
+/// Fragment ID a fragment descends into, or `None` when it renders inline.
+fn fragment_target_id(fragment: &WebUIFragment) -> Option<&str> {
+    match fragment.fragment.as_ref()? {
+        Fragment::Component(component) => Some(&component.fragment_id),
+        Fragment::ForLoop(for_loop) => Some(&for_loop.fragment_id),
+        Fragment::IfCond(if_cond) => Some(&if_cond.fragment_id),
+        Fragment::Attribute(attribute) if !attribute.template.is_empty() => {
+            Some(&attribute.template)
+        }
+        _ => None,
+    }
+}
+
 /// Context object for processing WebUI fragments
 pub(crate) struct WebUIProcessContext<'protocol, 'state, 'output> {
     pub(crate) protocol: &'protocol WebUIProtocol,
+    /// Render plan prepared once when the runtime [`Protocol`] was loaded.
+    /// Fragment lists resolve through numeric slots instead of per-fragment
+    /// string hashing.
+    pub(crate) render_fragments: ResolvedRenderFragmentIndex<'protocol>,
     /// Build-constant component asset style metadata serialized once when the
     /// runtime [`Protocol`] is created.
     pub(crate) component_asset_style_manifest: &'protocol str,
@@ -438,8 +822,17 @@ pub(crate) struct WebUIProcessContext<'protocol, 'state, 'output> {
     pub(crate) state: &'state Value,
     pub(crate) writer: &'output mut dyn ResponseWriter,
     pub(crate) local_vars: HashMap<String, Value>,
+    /// Component-local values that still point into immutable request state.
+    local_borrowed_vars: BorrowedScope<'protocol, 'state>,
+    /// Borrowed loop bindings, in lexical order.
+    loop_vars: Vec<LoopBinding<'protocol, 'state>>,
+    /// Range of `loop_vars` visible to the current fragment scope. Component
+    /// bodies hide outer loop monikers while still allowing their own loops.
+    visible_loop_scope: VisibleLoopScope,
     /// Accumulates component attribute values between attrStart and the component fragment.
     pub(crate) component_attrs: HashMap<String, Value>,
+    /// State-backed component attributes accumulated without cloning.
+    component_borrowed_attrs: BorrowedScope<'protocol, 'state>,
     /// True only while parser-produced component opening-tag attributes are
     /// being accumulated. Native element attributes render directly and never
     /// enter `component_attrs`.
@@ -555,6 +948,8 @@ pub(crate) struct WebUIProcessContext<'protocol, 'state, 'output> {
     /// Active Shadow roots and their route-activated resource indexes. The
     /// route vector allocates only when a matched Light route contributes CSS.
     pub(crate) shadow_style_roots: Vec<ShadowStyleRoot>,
+    /// Capacity-preserving pool for borrowed component scope maps.
+    borrowed_scope_pool: Vec<BorrowedScope<'protocol, 'state>>,
 }
 
 /// Compiler-owned signal namespace. The leading `}}}` cannot be produced by
@@ -609,6 +1004,19 @@ fn doctype_prefix_end(raw: &str) -> Option<usize> {
 /// Maximum scope maps retained in the request-local pool. Small: sibling
 /// component roots rarely nest deeply, so the cap keeps retained capacity bounded.
 const SCOPE_POOL_CAP: usize = 8;
+/// Borrowed component scopes typically contain only a handful of attributes.
+const INLINE_SCOPE_SLOTS: usize = 4;
+/// Fragment lists memoized inline per render. Sized to cover the distinct lists
+/// a typical app touches in one render while keeping the per-render zeroing cost
+/// negligible; larger protocols fall back to the protocol map for the overflow
+/// slots instead of eagerly materializing every list.
+/// Inline memo slots for fragment lists.
+///
+/// Deliberately small: the array is zeroed on every render, so a shallow render
+/// touching two fragments should not pay to clear slots it will never read.
+/// Deeper renders spill into a lazily allocated slice, which keeps them fully
+/// memoized without charging that cost to the common shallow case.
+const INLINE_RENDER_FRAGMENT_LISTS: usize = 8;
 const COMPONENT_ASSET_MANIFEST_ID: &str = "webui-component-assets";
 
 struct ComponentAssetStyleManifest<'a>(&'a [ComponentAssetStylePreload]);
@@ -697,6 +1105,22 @@ fn recycle_scope_map(pool: &mut Vec<HashMap<String, Value>>, mut map: HashMap<St
     }
 }
 
+fn take_borrowed_scope<'protocol, 'state>(
+    pool: &mut Vec<BorrowedScope<'protocol, 'state>>,
+) -> BorrowedScope<'protocol, 'state> {
+    pool.pop().unwrap_or_default()
+}
+
+fn recycle_borrowed_scope<'protocol, 'state>(
+    pool: &mut Vec<BorrowedScope<'protocol, 'state>>,
+    mut scope: BorrowedScope<'protocol, 'state>,
+) {
+    if pool.len() < SCOPE_POOL_CAP {
+        scope.clear();
+        pool.push(scope);
+    }
+}
+
 pub(crate) struct WebUiBootstrap<'a> {
     pub(crate) declaration_id: Option<u32>,
     pub(crate) enclosing_span_instance_id: Option<u32>,
@@ -716,9 +1140,53 @@ pub(crate) struct WebUiBootstrap<'a> {
 /// Uses `webui_protocol::attrs::attribute_to_camel` which handles irregular
 /// attributes (multi-word ARIA and global HTML attributes like `readonly`,
 /// `tabindex`) via the shared lookup table.
+///
+/// Renders read prepared names out of [`RenderFragmentIndex`] instead of calling
+/// this, so it remains only as the single-name form of
+/// [`push_component_attr_name`] for tests.
+#[cfg(test)]
 fn component_attr_name(name: &str) -> String {
+    let mut buffer = String::new();
+    push_component_attr_name(&mut buffer, name);
+    buffer
+}
+
+/// Append the canonical camelCase component prop name for `name` to `buffer`.
+///
+/// Strips a leading `:` and converts via `webui_protocol::attrs::attribute_to_camel`,
+/// which handles irregular attributes (multi-word ARIA and global HTML attributes
+/// like `readonly`, `tabindex`) through the shared lookup table.
+///
+/// Used while preparing the render fragment index so a protocol with thousands
+/// of attribute fragments grows one arena instead of allocating per name.
+fn push_component_attr_name(buffer: &mut String, name: &str) {
     let stripped = name.strip_prefix(':').unwrap_or(name);
-    webui_protocol::attrs::attribute_to_camel(stripped)
+    // Same conversion as `webui_protocol::attrs::attribute_to_camel`, written
+    // straight into the shared arena. That function returns an owned `String`,
+    // so calling it here would allocate and drop one buffer per attribute while
+    // preparing a protocol.
+    if let Some(property) = webui_protocol::attrs::attribute_to_property(stripped) {
+        buffer.push_str(property);
+        return;
+    }
+    buffer.reserve(stripped.len());
+    let mut capitalize_next = false;
+    for ch in stripped.chars() {
+        if ch == '-' {
+            capitalize_next = true;
+        } else if capitalize_next {
+            buffer.extend(ch.to_uppercase());
+            capitalize_next = false;
+        } else {
+            buffer.push(ch);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn missing_component_attr_name_error() -> HandlerError {
+    HandlerError::Invariant("prepared component attribute name is missing".to_string())
 }
 
 /// Write a usize as decimal digits directly to the writer, avoiding `format!` allocation.
@@ -1319,14 +1787,37 @@ fn write_webui_template_json_map(
 
 fn resolve_value_from_sources<'ctx, 'state>(
     path: &str,
-    local_vars: &'ctx HashMap<String, Value>,
+    loop_vars: &'ctx [LoopBinding<'_, 'state>],
+    visible_loop_scope: VisibleLoopScope,
+    local_values: LocalValueSources<'ctx, '_, 'state>,
     state: &'state Value,
 ) -> Option<Cow<'ctx, Value>>
 where
     'state: 'ctx,
 {
+    if let Some(binding) = loop_vars
+        .get(visible_loop_scope.start..visible_loop_scope.end)
+        .and_then(|bindings| bindings.last())
+    {
+        let name = binding.name;
+        if path.len() == name.len() && path == name {
+            return Some(Cow::Borrowed(binding.value));
+        }
+        if path.len() > name.len()
+            && path.as_bytes().get(name.len()) == Some(&b'.')
+            && path.starts_with(name)
+        {
+            if let Some(value) =
+                find_value_by_dotted_path_ref(&path[name.len() + 1..], binding.value)
+            {
+                return Some(value);
+            }
+            return find_value_by_dotted_path_ref(path, state);
+        }
+    }
+
     if let Some(first_part) = path.split('.').next() {
-        if let Some(local_value) = local_vars.get(first_part) {
+        if let Some(local_value) = local_values.borrowed.get(first_part) {
             if first_part.len() == path.len() {
                 return Some(Cow::Borrowed(local_value));
             }
@@ -1334,10 +1825,184 @@ where
             if let Some(value) = find_value_by_dotted_path_ref(remaining, local_value) {
                 return Some(value);
             }
+            return find_value_by_dotted_path_ref(path, state);
+        }
+        if let Some(local_value) = local_values.owned.get(first_part) {
+            if first_part.len() == path.len() {
+                return Some(Cow::Borrowed(local_value));
+            }
+            let remaining = &path[first_part.len() + 1..];
+            if let Some(value) = find_value_by_dotted_path_ref(remaining, local_value) {
+                return Some(value);
+            }
+            return find_value_by_dotted_path_ref(path, state);
+        }
+
+        for binding in loop_vars[visible_loop_scope.start..visible_loop_scope.end]
+            .iter()
+            .rev()
+        {
+            if binding.name != first_part {
+                continue;
+            }
+            if first_part.len() == path.len() {
+                return Some(Cow::Borrowed(binding.value));
+            }
+            let remaining = &path[first_part.len() + 1..];
+            if let Some(value) = find_value_by_dotted_path_ref(remaining, binding.value) {
+                return Some(value);
+            }
+            return find_value_by_dotted_path_ref(path, state);
         }
     }
 
     find_value_by_dotted_path_ref(path, state)
+}
+
+fn resolve_borrowed_collection<'state>(
+    path: &str,
+    loop_vars: &[LoopBinding<'_, 'state>],
+    visible_loop_scope: VisibleLoopScope,
+    local_values: LocalValueSources<'_, '_, 'state>,
+    state: &'state Value,
+) -> Option<&'state [Value]> {
+    let first_part = path.split('.').next()?;
+    if let Some(binding) = loop_vars
+        .get(visible_loop_scope.start..visible_loop_scope.end)
+        .and_then(|bindings| bindings.last())
+        .filter(|binding| binding.name == first_part)
+    {
+        if first_part.len() == path.len() {
+            return binding.value.as_array().map(Vec::as_slice);
+        }
+        let remaining = &path[first_part.len() + 1..];
+        return match find_value_by_dotted_path_ref(remaining, binding.value) {
+            Some(Cow::Borrowed(value)) => value.as_array().map(Vec::as_slice),
+            Some(Cow::Owned(_)) => None,
+            None => borrowed_state_array(path, state),
+        };
+    }
+    if let Some(local_value) = local_values.borrowed.get(first_part) {
+        let local_match = if first_part.len() == path.len() {
+            Some(Cow::Borrowed(local_value))
+        } else {
+            find_value_by_dotted_path_ref(&path[first_part.len() + 1..], local_value)
+        };
+        return match local_match {
+            Some(Cow::Borrowed(value)) => value.as_array().map(Vec::as_slice),
+            Some(Cow::Owned(_)) => None,
+            None => borrowed_state_array(path, state),
+        };
+    }
+    if let Some(local_value) = local_values.owned.get(first_part) {
+        let local_match = if first_part.len() == path.len() {
+            Some(Cow::Borrowed(local_value))
+        } else {
+            find_value_by_dotted_path_ref(&path[first_part.len() + 1..], local_value)
+        };
+        if local_match.is_some() {
+            return None;
+        }
+        return borrowed_state_array(path, state);
+    }
+
+    for binding in loop_vars[visible_loop_scope.start..visible_loop_scope.end]
+        .iter()
+        .rev()
+    {
+        if binding.name != first_part {
+            continue;
+        }
+        if first_part.len() == path.len() {
+            return binding.value.as_array().map(Vec::as_slice);
+        }
+        let remaining = &path[first_part.len() + 1..];
+        return match find_value_by_dotted_path_ref(remaining, binding.value) {
+            Some(Cow::Borrowed(value)) => value.as_array().map(Vec::as_slice),
+            Some(Cow::Owned(_)) => None,
+            None => borrowed_state_array(path, state),
+        };
+    }
+
+    borrowed_state_array(path, state)
+}
+
+fn resolve_state_backed_value<'state>(
+    path: &str,
+    loop_vars: &[LoopBinding<'_, 'state>],
+    visible_loop_scope: VisibleLoopScope,
+    local_values: LocalValueSources<'_, '_, 'state>,
+    state: &'state Value,
+) -> Option<&'state Value> {
+    let first_part = path.split('.').next()?;
+    if let Some(binding) = loop_vars
+        .get(visible_loop_scope.start..visible_loop_scope.end)
+        .and_then(|bindings| bindings.last())
+        .filter(|binding| binding.name == first_part)
+    {
+        if first_part.len() == path.len() {
+            return Some(binding.value);
+        }
+        let remaining = &path[first_part.len() + 1..];
+        return match find_value_by_dotted_path_ref(remaining, binding.value) {
+            Some(Cow::Borrowed(value)) => Some(value),
+            Some(Cow::Owned(_)) => None,
+            None => borrowed_state_value(path, state),
+        };
+    }
+    if let Some(local_value) = local_values.borrowed.get(first_part) {
+        if first_part.len() == path.len() {
+            return Some(local_value);
+        }
+        return match find_value_by_dotted_path_ref(&path[first_part.len() + 1..], local_value) {
+            Some(Cow::Borrowed(value)) => Some(value),
+            Some(Cow::Owned(_)) => None,
+            None => borrowed_state_value(path, state),
+        };
+    }
+    if let Some(local_value) = local_values.owned.get(first_part) {
+        if first_part.len() == path.len() {
+            return None;
+        }
+        return match find_value_by_dotted_path_ref(&path[first_part.len() + 1..], local_value) {
+            Some(_) => None,
+            None => borrowed_state_value(path, state),
+        };
+    }
+
+    for binding in loop_vars[visible_loop_scope.start..visible_loop_scope.end]
+        .iter()
+        .rev()
+    {
+        if binding.name != first_part {
+            continue;
+        }
+        if first_part.len() == path.len() {
+            return Some(binding.value);
+        }
+        let remaining = &path[first_part.len() + 1..];
+        return match find_value_by_dotted_path_ref(remaining, binding.value) {
+            Some(Cow::Borrowed(value)) => Some(value),
+            Some(Cow::Owned(_)) => None,
+            None => borrowed_state_value(path, state),
+        };
+    }
+
+    borrowed_state_value(path, state)
+}
+
+fn borrowed_state_value<'state>(path: &str, state: &'state Value) -> Option<&'state Value> {
+    match find_value_by_dotted_path_ref(path, state) {
+        Some(Cow::Borrowed(value)) => Some(value),
+        Some(Cow::Owned(_)) | None => None,
+    }
+}
+
+fn borrowed_state_array<'state>(path: &str, state: &'state Value) -> Option<&'state [Value]> {
+    match find_value_by_dotted_path_ref(path, state)? {
+        Cow::Borrowed(value) => value.as_array().map(Vec::as_slice),
+        Cow::Owned(_) => None,
+    }
 }
 
 impl WebUIHandler {
@@ -1370,20 +2035,24 @@ impl WebUIHandler {
         self.render(&protocol, state, options, writer)
     }
 
-    /// Process a fragment by its ID.
+    /// Process a fragment by its prepared render slot, falling back to an ID
+    /// lookup when the caller has no prepared slot (handler-generated hosts).
     ///
     /// The `context` parameter contains scope-local variables that are accessible during rendering,
     /// such as loop iteration variables. This is separate from the global `state`.
-    fn process_fragment_id<'data>(
+    fn process_fragment_target<'data>(
         &self,
+        target: Option<usize>,
         fragment_id: &str,
         context: &mut WebUIProcessContext<'data, '_, '_>,
     ) -> Result<()> {
-        if let Some(fragment_list) = context.protocol.fragments.get(fragment_id) {
-            self.process_fragment(&fragment_list.fragments, context)
-        } else {
-            Err(HandlerError::MissingFragment(fragment_id.to_string()))
-        }
+        let Some(index) = target.or_else(|| context.render_fragments.index(fragment_id)) else {
+            return Err(HandlerError::MissingFragment(fragment_id.to_string()));
+        };
+        let Some(fragment_list) = context.render_fragments.list(index) else {
+            return Err(HandlerError::MissingFragment(fragment_id.to_string()));
+        };
+        self.process_fragment(fragment_list, context)
     }
 
     /// Process a vector of fragments.
@@ -1392,37 +2061,45 @@ impl WebUIHandler {
     /// during rendering, while `state` contains the global application state.
     fn process_fragment<'data>(
         &self,
-        fragments: &'data [WebUIFragment],
+        fragment_list: RenderFragmentList<'data>,
         context: &mut WebUIProcessContext<'data, '_, '_>,
     ) -> Result<()> {
-        self.process_fragment_from(fragments, 0, context)
+        self.process_fragment_from(fragment_list, 0, context)
     }
 
     fn process_fragment_from<'data>(
         &self,
-        fragments: &'data [WebUIFragment],
+        fragment_list: RenderFragmentList<'data>,
         start: usize,
         context: &mut WebUIProcessContext<'data, '_, '_>,
     ) -> Result<()> {
+        let fragments = fragment_list.fragments;
         // Pre-scan: find the best matching route among sibling routes by specificity.
         // This ensures `/contacts/add` (2 literals) beats `/contacts/:id` (1 literal).
         // Resolves relative paths (`./`) using the current route_base.
-        let best_route = route_renderer::find_best_route_match(
-            fragments,
-            context.request_path,
-            &context.route_base,
-            context.route_index,
-        );
-        self.process_fragment_range(fragments, start..fragments.len(), &best_route, context)
+        // Lists prepared without any route fragment cannot produce a match, so
+        // the scan is skipped entirely for them.
+        let best_route = if fragment_list.has_routes {
+            route_renderer::find_best_route_match(
+                fragments,
+                context.request_path,
+                &context.route_base,
+                context.route_index,
+            )
+        } else {
+            None
+        };
+        self.process_fragment_range(fragment_list, start..fragments.len(), &best_route, context)
     }
 
     fn process_fragment_range<'data>(
         &self,
-        fragments: &'data [WebUIFragment],
+        fragment_list: RenderFragmentList<'data>,
         range: std::ops::Range<usize>,
         best_route: &Option<(String, route_matcher::RouteMatch)>,
         context: &mut WebUIProcessContext<'data, '_, '_>,
     ) -> Result<()> {
+        let fragments = fragment_list.fragments;
         let Some(selected) = fragments.get(range.clone()) else {
             return Err(invalid_fragment_range_error(&range, fragments.len()));
         };
@@ -1432,6 +2109,9 @@ impl WebUIHandler {
                 validate_pending_streaming_root(item, context)?;
                 validate_streaming_root_opening(&fragments[..index], item)?;
             }
+            // The prepared target is only read by fragments that descend, so it
+            // is resolved per-arm. Hoisting it here would charge every raw text
+            // fragment for a lookup it never uses.
             match item.fragment.as_ref() {
                 Some(Fragment::Raw(raw)) => {
                     context.writer.write(&raw.value)?;
@@ -1439,21 +2119,27 @@ impl WebUIHandler {
                 Some(Fragment::Component(component)) => {
                     self.process_component(
                         component,
+                        fragment_list.target(index),
                         ComponentHostOrigin::ParserProduced,
                         context,
                     )?;
                 }
                 Some(Fragment::ForLoop(for_loop)) => {
-                    self.process_for_loop(for_loop, context)?;
+                    self.process_for_loop(for_loop, fragment_list.target(index), context)?;
                 }
                 Some(Fragment::Signal(signal)) => {
                     self.process_signal(signal, context)?;
                 }
                 Some(Fragment::IfCond(if_cond)) => {
-                    self.process_if(if_cond, context)?;
+                    self.process_if(if_cond, fragment_list.target(index), context)?;
                 }
                 Some(Fragment::Attribute(attr)) => {
-                    self.process_attribute(attr, context)?;
+                    self.process_attribute(
+                        attr,
+                        fragment_list.target(index),
+                        fragment_list.component_attr_name(index),
+                        context,
+                    )?;
                 }
                 Some(Fragment::Plugin(plugin_frag)) => {
                     if let Some(p) = &mut context.plugin {
@@ -1553,7 +2239,11 @@ impl WebUIHandler {
                     self.emit_component_style_closure(comp, StyleClosureInstall::Routed, context)?;
                 }
                 if !matched_child.content_fragment_id.is_empty() {
-                    self.process_fragment_id(&matched_child.content_fragment_id, context)?;
+                    self.process_fragment_target(
+                        None,
+                        &matched_child.content_fragment_id,
+                        context,
+                    )?;
                 }
 
                 context.writer.write("<")?;
@@ -1568,6 +2258,7 @@ impl WebUIHandler {
                     &webui_protocol::WebUIFragmentComponent {
                         fragment_id: comp.clone(),
                     },
+                    None,
                     ComponentHostOrigin::HandlerGenerated,
                     context,
                 )?;
@@ -2025,7 +2716,7 @@ impl WebUIHandler {
             context.route_children = route_frag.children.clone();
 
             if !route_frag.content_fragment_id.is_empty() {
-                self.process_fragment_id(&route_frag.content_fragment_id, context)?;
+                self.process_fragment_target(None, &route_frag.content_fragment_id, context)?;
             }
 
             if !route_frag.fragment_id.is_empty() {
@@ -2048,7 +2739,12 @@ impl WebUIHandler {
                 prepare_generated_streaming_root(&route_frag.fragment_id, context)?;
                 context.writer.write(">")?;
 
-                self.process_component(&comp, ComponentHostOrigin::HandlerGenerated, context)?;
+                self.process_component(
+                    &comp,
+                    None,
+                    ComponentHostOrigin::HandlerGenerated,
+                    context,
+                )?;
 
                 context.writer.write("</")?;
                 context.writer.write(&route_frag.fragment_id)?;
@@ -2068,6 +2764,7 @@ impl WebUIHandler {
     fn process_component(
         &self,
         component: &webui_protocol::WebUIFragmentComponent,
+        target: Option<usize>,
         origin: ComponentHostOrigin,
         context: &mut WebUIProcessContext,
     ) -> Result<()> {
@@ -2097,6 +2794,7 @@ impl WebUIHandler {
 
         // Save parent scope. `mem::take` leaves an alloc-free empty map behind.
         let saved_local_vars = std::mem::take(&mut context.local_vars);
+        let saved_local_borrowed_vars = std::mem::take(&mut context.local_borrowed_vars);
         // The component's accumulated attrs become its local vars; the next
         // sibling accumulates into a recycled (capacity-preserving) map from the
         // request-local pool instead of a freshly allocated `HashMap`.
@@ -2104,14 +2802,25 @@ impl WebUIHandler {
             &mut context.component_attrs,
             take_scope_map(&mut context.scope_pool),
         );
+        let saved_component_borrowed_attrs = std::mem::replace(
+            &mut context.component_borrowed_attrs,
+            take_borrowed_scope(&mut context.borrowed_scope_pool),
+        );
         context.local_vars = saved_component_attrs;
+        context.local_borrowed_vars = saved_component_borrowed_attrs;
         context.collecting_component_attrs = false;
+        let saved_loop_scope = context.visible_loop_scope;
+        context.visible_loop_scope = VisibleLoopScope {
+            start: context.loop_vars.len(),
+            end: context.loop_vars.len(),
+        };
 
         if let Some(p) = &mut context.plugin {
             p.push_scope();
         }
 
-        let render_result = self.process_fragment_id(&component.fragment_id, context);
+        let render_result = self.process_fragment_target(target, &component.fragment_id, context);
+        context.visible_loop_scope = saved_loop_scope;
 
         if owns_css_tree {
             Self::pop_shadow_style_root(&component.fragment_id, context)?;
@@ -2126,9 +2835,13 @@ impl WebUIHandler {
         // accumulated attrs) back into the pool so a sibling reuses its capacity.
         let used_locals = std::mem::replace(&mut context.local_vars, saved_local_vars);
         recycle_scope_map(&mut context.scope_pool, used_locals);
+        let used_borrowed_locals =
+            std::mem::replace(&mut context.local_borrowed_vars, saved_local_borrowed_vars);
+        recycle_borrowed_scope(&mut context.borrowed_scope_pool, used_borrowed_locals);
         // The attr accumulator (pulled from the pool above) is cleared for the
         // next sibling while retaining its bucket capacity.
         context.component_attrs.clear();
+        context.component_borrowed_attrs.clear();
 
         Ok(())
     }
@@ -2180,13 +2893,23 @@ impl WebUIHandler {
         Ok(())
     }
 
-    /// Resolve a dotted path value, checking local variables first, then global state.
-    fn resolve_value(
+    /// Resolve a dotted path into owned state for values retained by the context.
+    fn resolve_value_owned(
         &self,
         path: &str,
         context: &WebUIProcessContext<'_, '_, '_>,
     ) -> Option<Value> {
-        resolve_value_from_sources(path, &context.local_vars, context.state).map(Cow::into_owned)
+        resolve_value_from_sources(
+            path,
+            &context.loop_vars,
+            context.visible_loop_scope,
+            LocalValueSources {
+                owned: &context.local_vars,
+                borrowed: &context.local_borrowed_vars,
+            },
+            context.state,
+        )
+        .map(Cow::into_owned)
     }
 
     /// Evaluate a condition expression against the current context.
@@ -2200,10 +2923,15 @@ impl WebUIHandler {
         condition: &webui_protocol::ConditionExpr,
         context: &WebUIProcessContext,
     ) -> Result<bool> {
-        let local_vars = &context.local_vars;
+        let loop_vars = &context.loop_vars;
+        let visible_loop_scope = context.visible_loop_scope;
+        let local_values = LocalValueSources {
+            owned: &context.local_vars,
+            borrowed: &context.local_borrowed_vars,
+        };
         let state = context.state;
         match evaluate_with_resolver(condition, |path| {
-            resolve_value_from_sources(path, local_vars, state)
+            resolve_value_from_sources(path, loop_vars, visible_loop_scope, local_values, state)
         }) {
             Ok(result) => Ok(result),
             Err(ExpressionError::MissingValue(_)) => Ok(false),
@@ -2216,16 +2944,86 @@ impl WebUIHandler {
     /// Creates a new context for each iteration that includes the current loop item.
     /// This allows nested templates to access both the loop variable and any parent context.
     /// Example: `for item in items` makes "item" available in the loop body.
-    fn process_for_loop(
+    fn process_for_loop<'protocol, 'state>(
         &self,
-        for_loop: &webui_protocol::WebUIFragmentFor,
-        context: &mut WebUIProcessContext,
+        for_loop: &'protocol webui_protocol::WebUIFragmentFor,
+        target: Option<usize>,
+        context: &mut WebUIProcessContext<'protocol, 'state, '_>,
+    ) -> Result<()> {
+        if let Some(items) = resolve_borrowed_collection(
+            &for_loop.collection,
+            &context.loop_vars,
+            context.visible_loop_scope,
+            LocalValueSources {
+                owned: &context.local_vars,
+                borrowed: &context.local_borrowed_vars,
+            },
+            context.state,
+        ) {
+            return self.process_borrowed_for_loop(for_loop, target, items, context);
+        }
+        self.process_owned_for_loop(for_loop, target, context)
+    }
+
+    fn process_borrowed_for_loop<'protocol, 'state>(
+        &self,
+        for_loop: &'protocol webui_protocol::WebUIFragmentFor,
+        target: Option<usize>,
+        items: &'state [Value],
+        context: &mut WebUIProcessContext<'protocol, 'state, '_>,
+    ) -> Result<()> {
+        if let Some(plugin) = &mut context.plugin {
+            plugin.on_for_start(&for_loop.fragment_id, context.writer)?;
+        }
+
+        let item_name = for_loop.item.as_str();
+        let saved_value = context.local_vars.remove(item_name);
+        let saved_borrowed_value = context.local_borrowed_vars.remove(item_name);
+        let saved_scope = context.visible_loop_scope;
+        for (index, item) in items.iter().enumerate() {
+            if let Some(plugin) = &mut context.plugin {
+                plugin.on_repeat_item_start(index, context.writer)?;
+                plugin.push_scope();
+            }
+
+            context.loop_vars.push(LoopBinding {
+                name: item_name,
+                value: item,
+            });
+            context.visible_loop_scope.end = context.loop_vars.len();
+            self.process_fragment_target(target, &for_loop.fragment_id, context)?;
+            context.loop_vars.pop();
+            context.visible_loop_scope = saved_scope;
+
+            if let Some(plugin) = &mut context.plugin {
+                plugin.pop_scope();
+                plugin.on_repeat_item_end(index, context.writer)?;
+            }
+        }
+        if let Some(value) = saved_value {
+            context.local_vars.insert(item_name.to_string(), value);
+        }
+        if let Some(value) = saved_borrowed_value {
+            context.local_borrowed_vars.insert(item_name, value);
+        }
+
+        if let Some(plugin) = &mut context.plugin {
+            plugin.on_for_end(&for_loop.fragment_id, context.writer)?;
+        }
+        Ok(())
+    }
+
+    fn process_owned_for_loop<'protocol, 'state>(
+        &self,
+        for_loop: &'protocol webui_protocol::WebUIFragmentFor,
+        target: Option<usize>,
+        context: &mut WebUIProcessContext<'protocol, 'state, '_>,
     ) -> Result<()> {
         let collection_name = &for_loop.collection;
 
         // If the collection is missing, treat it as empty (0 iterations) — matches NodeJS behavior.
         // Hydration comments are always emitted regardless of collection presence.
-        let items = match self.resolve_value(collection_name, context) {
+        let items = match self.resolve_value_owned(collection_name, context) {
             Some(Value::Array(arr)) => arr,
             Some(_) => {
                 return Err(HandlerError::TypeError(format!(
@@ -2249,6 +3047,7 @@ impl WebUIHandler {
         // iteration via `get_mut`. Restoration at the end happens once.
         let item_name = for_loop.item.as_str();
         let saved_value = context.local_vars.remove(item_name);
+        let saved_borrowed_value = context.local_borrowed_vars.remove(item_name);
         // Pre-insert the key so per-iteration `get_mut` is infallible.
         // Cost: at most one `String::from(item_name)` for the lifetime
         // of the loop, regardless of iteration count.
@@ -2267,7 +3066,7 @@ impl WebUIHandler {
             if let Some(slot) = context.local_vars.get_mut(item_name) {
                 *slot = item;
             }
-            self.process_fragment_id(&for_loop.fragment_id, context)?;
+            self.process_fragment_target(target, &for_loop.fragment_id, context)?;
 
             if let Some(p) = &mut context.plugin {
                 p.pop_scope();
@@ -2282,6 +3081,9 @@ impl WebUIHandler {
             None => {
                 context.local_vars.remove(item_name);
             }
+        }
+        if let Some(value) = saved_borrowed_value {
+            context.local_borrowed_vars.insert(item_name, value);
         }
 
         if let Some(p) = &mut context.plugin {
@@ -2635,8 +3437,17 @@ impl WebUIHandler {
             p.on_binding_start(&signal.value, owns_html_range, context.writer)?;
         }
 
-        if let Some(value) = self.resolve_value(&signal.value, context) {
-            self.write_signal_value(&value, signal.raw, context.writer)?;
+        if let Some(value) = resolve_value_from_sources(
+            &signal.value,
+            &context.loop_vars,
+            context.visible_loop_scope,
+            LocalValueSources {
+                owned: &context.local_vars,
+                borrowed: &context.local_borrowed_vars,
+            },
+            context.state,
+        ) {
+            self.write_signal_value(value.as_ref(), signal.raw, context.writer)?;
         }
 
         if let Some(p) = &mut context.plugin {
@@ -2679,6 +3490,7 @@ impl WebUIHandler {
     fn process_if(
         &self,
         if_cond: &webui_protocol::WebUIFragmentIf,
+        target: Option<usize>,
         context: &mut WebUIProcessContext,
     ) -> Result<()> {
         let condition = if_cond
@@ -2696,7 +3508,7 @@ impl WebUIHandler {
                 p.push_scope();
             }
 
-            self.process_fragment_id(&if_cond.fragment_id, context)?;
+            self.process_fragment_target(target, &if_cond.fragment_id, context)?;
 
             if let Some(p) = &mut context.plugin {
                 p.pop_scope();
@@ -2711,15 +3523,22 @@ impl WebUIHandler {
     }
 
     /// Process an attribute fragment by rendering the attribute name/value pair.
-    fn process_attribute(
+    ///
+    /// `template_target` and `component_name` are prepared once per protocol by
+    /// [`RenderFragmentIndex`], so neither the template fragment lookup nor the
+    /// camelCase prop-name conversion is repeated per render.
+    fn process_attribute<'protocol, 'state>(
         &self,
-        attr: &webui_protocol::WebUIFragmentAttribute,
-        context: &mut WebUIProcessContext,
+        attr: &'protocol webui_protocol::WebUIFragmentAttribute,
+        template_target: Option<usize>,
+        component_name: Option<&'protocol str>,
+        context: &mut WebUIProcessContext<'protocol, 'state, '_>,
     ) -> Result<()> {
         // Initialize component attribute accumulator on attrStart. Clearing the
         // pooled map keeps its bucket capacity instead of allocating a fresh one.
         if attr.attr_start {
             context.component_attrs.clear();
+            context.component_borrowed_attrs.clear();
             context.collecting_component_attrs = true;
         }
 
@@ -2728,10 +3547,11 @@ impl WebUIHandler {
             let condition_met = self.evaluate_condition(condition, context)?;
 
             if context.collecting_component_attrs && !attr.attr_skip {
-                let name = component_attr_name(&attr.name);
+                let name = component_name.ok_or_else(missing_component_attr_name_error)?;
+                context.component_borrowed_attrs.remove(name);
                 context
                     .component_attrs
-                    .insert(name, Value::Bool(condition_met));
+                    .insert(name.to_owned(), Value::Bool(condition_met));
             }
 
             if condition_met {
@@ -2743,15 +3563,17 @@ impl WebUIHandler {
 
         // Template attribute (mixed static + dynamic)
         if !attr.template.is_empty() {
-            let raw_value = self.render_template_attr_value(&attr.template, context)?;
+            let raw_value =
+                self.render_template_attr_value(&attr.template, template_target, context)?;
             let escaped = crate::html_encode::encode_safe(&raw_value);
             write_attr(context.writer, &attr.name, &escaped)?;
 
             if context.collecting_component_attrs && !attr.attr_skip {
-                let name = component_attr_name(&attr.name);
+                let name = component_name.ok_or_else(missing_component_attr_name_error)?;
+                context.component_borrowed_attrs.remove(name);
                 context
                     .component_attrs
-                    .insert(name, Value::String(raw_value));
+                    .insert(name.to_owned(), Value::String(raw_value));
             }
             return Ok(());
         }
@@ -2762,26 +3584,74 @@ impl WebUIHandler {
                 // Static attribute — value is the literal string
                 write_attr(context.writer, &attr.name, &attr.value)?;
                 if context.collecting_component_attrs && !attr.attr_skip {
-                    let name = component_attr_name(&attr.name);
+                    let name = component_name.ok_or_else(missing_component_attr_name_error)?;
+                    context.component_borrowed_attrs.remove(name);
                     context
                         .component_attrs
-                        .insert(name, Value::String(attr.value.clone()));
+                        .insert(name.to_owned(), Value::String(attr.value.clone()));
                 }
             } else if attr.complex {
                 // Complex attribute — resolve value, don't render to HTML, store as state
-                if let Some(value) = self.resolve_value(&attr.value, context) {
-                    if context.collecting_component_attrs && !attr.attr_skip {
-                        let stripped = attr.name.strip_prefix(':').unwrap_or(&attr.name);
-                        let name = component_attr_name(stripped);
-                        context.component_attrs.insert(name, value);
+                if context.collecting_component_attrs && !attr.attr_skip {
+                    let state_backed_value = if context.streaming.is_none() {
+                        resolve_state_backed_value(
+                            &attr.value,
+                            &context.loop_vars,
+                            context.visible_loop_scope,
+                            LocalValueSources {
+                                owned: &context.local_vars,
+                                borrowed: &context.local_borrowed_vars,
+                            },
+                            context.state,
+                        )
+                    } else {
+                        None
+                    };
+                    if let Some(value) = state_backed_value {
+                        let name = component_name.ok_or_else(missing_component_attr_name_error)?;
+                        context.component_attrs.remove(name);
+                        context.component_borrowed_attrs.insert(name, value);
+                    } else if let Some(value) = self.resolve_value_owned(&attr.value, context) {
+                        let name = component_name.ok_or_else(missing_component_attr_name_error)?;
+                        context.component_borrowed_attrs.remove(name);
+                        context.component_attrs.insert(name.to_owned(), value);
                     }
                 }
             } else {
                 // Dynamic attribute — resolve and render
-                let value = self.resolve_value(&attr.value, context);
+                // Streaming continuations must own component locals across host
+                // calls, so borrowing there would add a second lookup before the
+                // VM materializes the same value.
+                let state_backed_value = if context.collecting_component_attrs
+                    && !attr.attr_skip
+                    && context.streaming.is_none()
+                {
+                    resolve_state_backed_value(
+                        &attr.value,
+                        &context.loop_vars,
+                        context.visible_loop_scope,
+                        LocalValueSources {
+                            owned: &context.local_vars,
+                            borrowed: &context.local_borrowed_vars,
+                        },
+                        context.state,
+                    )
+                } else {
+                    None
+                };
+                let value = resolve_value_from_sources(
+                    &attr.value,
+                    &context.loop_vars,
+                    context.visible_loop_scope,
+                    LocalValueSources {
+                        owned: &context.local_vars,
+                        borrowed: &context.local_borrowed_vars,
+                    },
+                    context.state,
+                );
                 // Always emit the attribute so FAST hydration markers
                 // (`data-fe`) match the DOM node structure.
-                match &value {
+                match value.as_deref() {
                     Some(Value::String(s)) => {
                         write_attr(
                             context.writer,
@@ -2803,10 +3673,20 @@ impl WebUIHandler {
                 }
 
                 if context.collecting_component_attrs && !attr.attr_skip {
-                    let name = component_attr_name(&attr.name);
-                    context
-                        .component_attrs
-                        .insert(name, value.unwrap_or(Value::String(String::new())));
+                    if let Some(borrowed) = state_backed_value {
+                        let name = component_name.ok_or_else(missing_component_attr_name_error)?;
+                        context.component_attrs.remove(name);
+                        context.component_borrowed_attrs.insert(name, borrowed);
+                    } else {
+                        let name = component_name.ok_or_else(missing_component_attr_name_error)?;
+                        context.component_borrowed_attrs.remove(name);
+                        context.component_attrs.insert(
+                            name.to_owned(),
+                            value
+                                .map(Cow::into_owned)
+                                .unwrap_or(Value::String(String::new())),
+                        );
+                    }
                 }
             }
         }
@@ -2818,20 +3698,32 @@ impl WebUIHandler {
     fn render_template_attr_value(
         &self,
         template_id: &str,
+        target: Option<usize>,
         context: &WebUIProcessContext,
     ) -> Result<String> {
+        let Some(index) = target.or_else(|| context.render_fragments.index(template_id)) else {
+            return Err(HandlerError::MissingFragment(template_id.to_string()));
+        };
         let fragments = context
-            .protocol
-            .fragments
-            .get(template_id)
+            .render_fragments
+            .list(index)
             .ok_or_else(|| HandlerError::MissingFragment(template_id.to_string()))?;
         let mut raw_value = String::new();
-        for frag in &fragments.fragments {
+        for frag in fragments.fragments {
             match frag.fragment.as_ref() {
                 Some(Fragment::Raw(raw)) => raw_value.push_str(&raw.value),
                 Some(Fragment::Signal(signal)) => {
-                    if let Some(value) = self.resolve_value(&signal.value, context) {
-                        match &value {
+                    if let Some(value) = resolve_value_from_sources(
+                        &signal.value,
+                        &context.loop_vars,
+                        context.visible_loop_scope,
+                        LocalValueSources {
+                            owned: &context.local_vars,
+                            borrowed: &context.local_borrowed_vars,
+                        },
+                        context.state,
+                    ) {
+                        match value.as_ref() {
                             Value::String(s) => raw_value.push_str(s),
                             _ => raw_value.push_str(&value.to_string()),
                         }
@@ -2853,9 +3745,12 @@ impl WebUIHandler {
     ) -> Result<()> {
         protocol.ensure_style_metadata()?;
         let document = protocol.protocol();
-        let entry = document
-            .fragments
-            .get(options.entry_id)
+        let render_fragments = protocol.render_fragments().resolve(document);
+        let Some(entry_index) = render_fragments.index(options.entry_id) else {
+            return Err(HandlerError::MissingFragment(options.entry_id.to_string()));
+        };
+        let entry = render_fragments
+            .list(entry_index)
             .ok_or_else(|| HandlerError::MissingFragment(options.entry_id.to_string()))?;
         let entry_owns_css_tree = Self::component_owns_css_tree(options.entry_id, document);
         let has_document_head_boundary = !entry_owns_css_tree
@@ -2884,12 +3779,17 @@ impl WebUIHandler {
         let component_asset_style_manifest = protocol.component_asset_style_manifest()?;
         let mut context = WebUIProcessContext {
             protocol: document,
+            render_fragments,
             component_asset_style_manifest,
             component_asset_style_links: protocol.component_asset_style_links(),
             state,
             writer,
             local_vars: HashMap::new(),
+            local_borrowed_vars: BorrowedScope::default(),
+            loop_vars: Vec::new(),
+            visible_loop_scope: VisibleLoopScope::EMPTY,
             component_attrs: HashMap::new(),
+            component_borrowed_attrs: BorrowedScope::default(),
             collecting_component_attrs: false,
             request_path: options.request_path,
             route_base: Cow::Borrowed("/"),
@@ -2921,6 +3821,7 @@ impl WebUIHandler {
             scope_pool: Vec::new(),
             document_style_resources: HashSet::new(),
             shadow_style_roots: Vec::new(),
+            borrowed_scope_pool: Vec::new(),
         };
 
         if entry_owns_css_tree {
@@ -2936,7 +3837,7 @@ impl WebUIHandler {
             )?;
             self.emit_active_route_styles(&mut Vec::new(), &mut context)?;
             context.writer.write(&first_raw[split..])?;
-            self.process_fragment_from(&entry.fragments, 1, &mut context)
+            self.process_fragment_from(entry, 1, &mut context)
         } else {
             if !entry_owns_css_tree
                 && !has_document_head_boundary
@@ -2949,7 +3850,7 @@ impl WebUIHandler {
                 )?;
                 self.emit_active_route_styles(&mut Vec::new(), &mut context)?;
             }
-            self.process_fragment_id(options.entry_id, &mut context)
+            self.process_fragment(entry, &mut context)
         };
 
         if entry_owns_css_tree {
@@ -3001,6 +3902,201 @@ mod tests {
             format!("{STRUCTURAL_SIGNAL_PREFIX}{}", value.as_ref()),
             true,
         )
+    }
+
+    #[test]
+    fn borrowed_collection_reuses_state_array() {
+        let state = test_json!({
+            "items": [
+                {"name": "first"},
+                {"name": "second"}
+            ]
+        });
+        let local_vars = HashMap::new();
+        let local_borrowed_vars = BorrowedScope::default();
+        let loop_vars = Vec::new();
+        let items = resolve_borrowed_collection(
+            "items",
+            &loop_vars,
+            VisibleLoopScope::EMPTY,
+            LocalValueSources {
+                owned: &local_vars,
+                borrowed: &local_borrowed_vars,
+            },
+            &state,
+        )
+        .unwrap_or_else(|| panic!("state array should be borrowed"));
+        let state_items = state["items"]
+            .as_array()
+            .unwrap_or_else(|| panic!("fixture items should be an array"));
+        assert!(std::ptr::eq(items.as_ptr(), state_items.as_ptr()));
+    }
+
+    #[test]
+    fn owned_local_collection_keeps_precedence() {
+        let state = test_json!({"items": [{"name": "global"}]});
+        let local_vars = HashMap::from([("items".to_string(), test_json!([{"name": "local"}]))]);
+        let local_borrowed_vars = BorrowedScope::default();
+        assert!(resolve_borrowed_collection(
+            "items",
+            &[],
+            VisibleLoopScope::EMPTY,
+            LocalValueSources {
+                owned: &local_vars,
+                borrowed: &local_borrowed_vars,
+            },
+            &state,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn borrowed_component_collection_reuses_state_array() {
+        let state = test_json!({"teams": [{"contacts": [{"name": "Avery"}]}]});
+        let contacts = &state["teams"][0]["contacts"];
+        let mut local_borrowed_vars = BorrowedScope::default();
+        local_borrowed_vars.insert("contacts", contacts);
+        let local_vars = HashMap::new();
+        let items = resolve_borrowed_collection(
+            "contacts",
+            &[],
+            VisibleLoopScope::EMPTY,
+            LocalValueSources {
+                owned: &local_vars,
+                borrowed: &local_borrowed_vars,
+            },
+            &state,
+        )
+        .unwrap_or_else(|| panic!("component collection should stay borrowed"));
+        let state_items = contacts
+            .as_array()
+            .unwrap_or_else(|| panic!("fixture contacts should be an array"));
+        assert!(std::ptr::eq(items.as_ptr(), state_items.as_ptr()));
+    }
+
+    #[test]
+    fn nested_borrowed_collection_reuses_child_array() {
+        let state = test_json!({
+            "items": [{
+                "children": [
+                    {"name": "first"},
+                    {"name": "second"}
+                ]
+            }]
+        });
+        let item = &state["items"][0];
+        let loop_vars = vec![LoopBinding {
+            name: "item",
+            value: item,
+        }];
+        let local_vars = HashMap::new();
+        let local_borrowed_vars = BorrowedScope::default();
+        let children = resolve_borrowed_collection(
+            "item.children",
+            &loop_vars,
+            VisibleLoopScope { start: 0, end: 1 },
+            LocalValueSources {
+                owned: &local_vars,
+                borrowed: &local_borrowed_vars,
+            },
+            &state,
+        )
+        .unwrap_or_else(|| panic!("nested state array should be borrowed"));
+        let state_children = item["children"]
+            .as_array()
+            .unwrap_or_else(|| panic!("fixture children should be an array"));
+        assert!(std::ptr::eq(children.as_ptr(), state_children.as_ptr()));
+    }
+
+    #[test]
+    fn borrowed_resolver_preserves_loop_precedence_and_component_isolation() {
+        let state = test_json!({
+            "item": {"name": "global", "fallback": "global fallback"},
+            "outer": {"name": "outer"},
+            "inner": {"name": "inner"}
+        });
+        let loop_vars = vec![
+            LoopBinding {
+                name: "item",
+                value: &state["outer"],
+            },
+            LoopBinding {
+                name: "item",
+                value: &state["inner"],
+            },
+        ];
+        let local_vars = HashMap::new();
+        let local_borrowed_vars = BorrowedScope::default();
+        let sources = LocalValueSources {
+            owned: &local_vars,
+            borrowed: &local_borrowed_vars,
+        };
+
+        assert_eq!(
+            resolve_value_from_sources(
+                "item.name",
+                &loop_vars,
+                VisibleLoopScope { start: 0, end: 2 },
+                sources,
+                &state,
+            )
+            .as_deref()
+            .and_then(Value::as_str),
+            Some("inner")
+        );
+        assert_eq!(
+            resolve_value_from_sources(
+                "item.fallback",
+                &loop_vars,
+                VisibleLoopScope { start: 0, end: 2 },
+                sources,
+                &state,
+            )
+            .as_deref()
+            .and_then(Value::as_str),
+            Some("global fallback")
+        );
+        assert_eq!(
+            resolve_value_from_sources(
+                "item.name",
+                &loop_vars,
+                VisibleLoopScope { start: 2, end: 2 },
+                sources,
+                &state,
+            )
+            .as_deref()
+            .and_then(Value::as_str),
+            Some("global")
+        );
+    }
+
+    #[test]
+    fn borrowed_scope_preserves_inline_overflow_and_replacement_semantics() {
+        let values = [
+            Value::String("a".to_string()),
+            Value::String("b".to_string()),
+            Value::String("c".to_string()),
+            Value::String("d".to_string()),
+            Value::String("e".to_string()),
+            Value::String("f".to_string()),
+            Value::String("replacement".to_string()),
+        ];
+        let mut scope = BorrowedScope::default();
+        for (index, name) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+            assert!(scope.insert(name, &values[index]).is_none());
+        }
+        assert_eq!(scope.inline_len, INLINE_SCOPE_SLOTS);
+        assert_eq!(scope.overflow.len(), 2);
+        assert_eq!(scope.get("a"), Some(&values[0]));
+        assert_eq!(scope.get("f"), Some(&values[5]));
+        assert_eq!(scope.insert("a", &values[6]), Some(&values[0]));
+        assert_eq!(scope.get("a"), Some(&values[6]));
+        assert_eq!(scope.remove("b"), Some(&values[1]));
+        assert!(scope.get("b").is_none());
+        assert_eq!(scope.get("f"), Some(&values[5]));
+        scope.clear();
+        assert!(scope.get("a").is_none());
+        assert!(scope.overflow.is_empty());
     }
 
     // A simple test writer implementation
@@ -3066,6 +4162,310 @@ mod tests {
             .write_boolean_attribute("disabled")
             .unwrap_or_else(|error| panic!("boolean attribute write failed: {error}"));
         assert_eq!(writer.output, " data-id=\"42\" disabled");
+    }
+
+    #[test]
+    fn prepared_graph_resolves_targets_and_canonical_component_prop_names() {
+        let mut fragments = HashMap::new();
+        fragments.insert(
+            "index.html".to_string(),
+            FragmentList {
+                fragments: vec![
+                    WebUIFragment {
+                        fragment: Some(Fragment::Attribute(WebUIFragmentAttribute {
+                            name: ":data-title".to_string(),
+                            value: "source".to_string(),
+                            complex: true,
+                            attr_start: true,
+                            ..Default::default()
+                        })),
+                    },
+                    WebUIFragment::component("prepared-child"),
+                ],
+                contains_boundary: false,
+            },
+        );
+        fragments.insert(
+            "prepared-child".to_string(),
+            FragmentList {
+                fragments: vec![WebUIFragment::signal("dataTitle", false)],
+                contains_boundary: false,
+            },
+        );
+        let protocol = Protocol::new(WebUIProtocol::new(fragments));
+        let resolved = protocol.render_fragments().resolve(protocol.protocol());
+        let entry = resolved
+            .list_by_id("index.html")
+            .unwrap_or_else(|| panic!("entry render plan should exist"));
+        let child_index = protocol
+            .render_fragments()
+            .index("prepared-child")
+            .unwrap_or_else(|| panic!("component target should be indexed"));
+        assert_eq!(entry.component_attr_name(0), Some("dataTitle"));
+        assert_eq!(entry.target(1), Some(child_index));
+        assert!(!entry.has_routes);
+        let source_entry = protocol
+            .protocol()
+            .fragments
+            .get("index.html")
+            .unwrap_or_else(|| panic!("source entry should exist"));
+        assert!(std::ptr::eq(
+            entry.fragments.as_ptr(),
+            source_entry.fragments.as_ptr()
+        ));
+
+        let state = test_json!({"source": "Prepared"});
+        let options = RenderOptions::new("index.html", "/");
+        for handler in [
+            WebUIHandler::new(),
+            WebUIHandler::with_plugin(|| {
+                Box::new(crate::plugin::webui::WebUIHydrationPlugin::new())
+            }),
+        ] {
+            let mut writer = TestWriter::new();
+            assert!(handler
+                .render(&protocol, &state, &options, &mut writer)
+                .is_ok());
+            assert!(writer.get_content().contains("Prepared"));
+        }
+    }
+
+    #[test]
+    fn prepared_graph_records_route_presence_per_fragment_list() {
+        let mut fragments = HashMap::new();
+        fragments.insert(
+            "index.html".to_string(),
+            FragmentList {
+                fragments: vec![WebUIFragment::route("/", "dash-page")],
+                contains_boundary: false,
+            },
+        );
+        fragments.insert(
+            "dash-page".to_string(),
+            FragmentList {
+                fragments: vec![WebUIFragment::raw("dashboard")],
+                contains_boundary: false,
+            },
+        );
+        let protocol = Protocol::new(WebUIProtocol::new(fragments));
+        let resolved = protocol.render_fragments().resolve(protocol.protocol());
+        let entry = resolved
+            .list_by_id("index.html")
+            .unwrap_or_else(|| panic!("entry render plan should exist"));
+        let page = resolved
+            .list_by_id("dash-page")
+            .unwrap_or_else(|| panic!("page render plan should exist"));
+        // Only lists that actually contain a route pay for the sibling scan.
+        assert!(entry.has_routes);
+        assert!(!page.has_routes);
+    }
+
+    #[test]
+    fn prepared_prop_names_match_attribute_to_camel_exactly() {
+        // Preparation writes the camelCase conversion straight into the shared
+        // arena instead of calling `attribute_to_camel`, which allocates. The two
+        // must stay byte-identical, including the irregular lookup-table entries.
+        let names = [
+            "data-title",
+            ":data-title",
+            "aria-labelledby",
+            "aria-valuemax",
+            "readonly",
+            "tabindex",
+            "class",
+            "for",
+            "maxlength",
+            "novalidate",
+            "already-camel",
+            "trailing-",
+            "-leading",
+            "multi-part-attribute-name",
+            "single",
+            "",
+        ];
+        for name in names {
+            let stripped = name.strip_prefix(':').unwrap_or(name);
+            assert_eq!(
+                component_attr_name(name),
+                webui_protocol::attrs::attribute_to_camel(stripped),
+                "prepared name diverged for `{name}`"
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_component_prop_names_match_per_branch_stripping() {
+        // The render path strips a leading `:` twice on the complex-value branch
+        // and once elsewhere. Preparation must reproduce that per branch or a
+        // `::`-prefixed binding would change the emitted component prop name.
+        let complex = WebUIFragmentAttribute {
+            name: "::data-title".to_string(),
+            value: "source".to_string(),
+            complex: true,
+            ..Default::default()
+        };
+        assert_eq!(component_attr_source(&complex), ":data-title");
+        assert_eq!(
+            component_attr_name(component_attr_source(&complex)),
+            "dataTitle"
+        );
+
+        // `raw_value` takes the static branch, which strips only once.
+        let raw = WebUIFragmentAttribute {
+            raw_value: true,
+            ..complex.clone()
+        };
+        assert_eq!(component_attr_source(&raw), "::data-title");
+
+        // A template attribute returns before the complex branch is reached.
+        let templated = WebUIFragmentAttribute {
+            template: "tpl".to_string(),
+            ..complex.clone()
+        };
+        assert_eq!(component_attr_source(&templated), "::data-title");
+
+        // An empty value never reaches the complex branch either.
+        let empty_value = WebUIFragmentAttribute {
+            value: String::new(),
+            ..complex.clone()
+        };
+        assert_eq!(component_attr_source(&empty_value), "::data-title");
+
+        // Ordinary single-colon bindings are unaffected on every branch.
+        let ordinary = WebUIFragmentAttribute {
+            name: ":data-title".to_string(),
+            ..complex
+        };
+        assert_eq!(component_attr_source(&ordinary), "data-title");
+        assert_eq!(
+            component_attr_name(component_attr_source(&ordinary)),
+            "dataTitle"
+        );
+    }
+
+    #[test]
+    fn render_slots_match_continuation_slots() {
+        // The streaming VM reads prepared metadata with the continuation slot
+        // directly. That is only sound while both numberings index the same
+        // sorted fragment IDs, so pin the invariant here rather than paying for
+        // an ID lookup per streamed fragment frame.
+        let mut fragments = HashMap::new();
+        for id in [
+            "index.html",
+            "zeta-last",
+            "alpha-first",
+            "middle-one",
+            "middle-two",
+        ] {
+            fragments.insert(
+                id.to_string(),
+                FragmentList {
+                    fragments: vec![WebUIFragment::raw(id)],
+                    contains_boundary: false,
+                },
+            );
+        }
+        let protocol = Protocol::new(WebUIProtocol::new(fragments));
+        let index = protocol.render_fragments();
+        for slot in 0..u32::try_from(protocol.protocol().fragments.len())
+            .unwrap_or_else(|_| panic!("fragment count fits in u32"))
+        {
+            let id = protocol
+                .fragment_id(slot)
+                .unwrap_or_else(|| panic!("slot {slot} should resolve to an ID"));
+            assert_eq!(
+                index.index(id),
+                Some(slot as usize),
+                "render slot must equal continuation slot for `{id}`"
+            );
+            assert_eq!(protocol.fragment_slot(id), Some(slot));
+        }
+    }
+
+    #[test]
+    fn prepared_graph_reports_missing_fragments_without_panicking() {
+        let mut fragments = HashMap::new();
+        fragments.insert(
+            "index.html".to_string(),
+            FragmentList {
+                fragments: vec![WebUIFragment::component("absent-child")],
+                contains_boundary: false,
+            },
+        );
+        let protocol = Protocol::new(WebUIProtocol::new(fragments));
+        let resolved = protocol.render_fragments().resolve(protocol.protocol());
+        let entry = resolved
+            .list_by_id("index.html")
+            .unwrap_or_else(|| panic!("entry render plan should exist"));
+        // An unresolvable reference keeps a `None` target and must not index
+        // out of range or silently render an unrelated fragment list.
+        assert_eq!(entry.target(0), None);
+        assert!(resolved.list_by_id("absent-child").is_none());
+        assert!(resolved.list(usize::MAX).is_none());
+
+        let state = test_json!({});
+        let options = RenderOptions::new("index.html", "/");
+        let mut writer = TestWriter::new();
+        match WebUIHandler::new().render(&protocol, &state, &options, &mut writer) {
+            Err(HandlerError::MissingFragment(id)) => assert_eq!(id, "absent-child"),
+            other => panic!("expected a missing fragment error, got {other:?}"),
+        }
+
+        let mut writer = TestWriter::new();
+        match WebUIHandler::new().render(
+            &protocol,
+            &state,
+            &RenderOptions::new("absent-entry", "/"),
+            &mut writer,
+        ) {
+            Err(HandlerError::MissingFragment(id)) => assert_eq!(id, "absent-entry"),
+            other => panic!("expected a missing entry error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn prepared_graph_lazily_borrows_large_protocol_fragment_lists() {
+        let list_count = INLINE_RENDER_FRAGMENT_LISTS * 2 + 1;
+        let mut fragments = HashMap::with_capacity(list_count);
+        for index in 0..list_count {
+            fragments.insert(
+                format!("fragment-{index}"),
+                FragmentList {
+                    fragments: vec![WebUIFragment::raw("content")],
+                    contains_boundary: false,
+                },
+            );
+        }
+        let protocol = Protocol::new(WebUIProtocol::new(fragments));
+        let resolved = protocol.render_fragments().resolve(protocol.protocol());
+        // Nothing is materialized until a slot is actually rendered.
+        assert!(resolved.cache[0].get().is_none());
+        assert!(resolved.spilled.get().is_none());
+        assert!(resolved.list(0).is_some());
+        assert!(resolved.cache[0].get().is_some());
+        // Rendering only inline slots never allocates the spill region.
+        assert!(resolved.spilled.get().is_none());
+        // Slots past the inline cache spill once, then stay memoized so a deep
+        // descent never re-hashes the fragment ID.
+        assert!(resolved.list(INLINE_RENDER_FRAGMENT_LISTS).is_some());
+        let spilled = resolved
+            .spilled
+            .get()
+            .expect("a slot past the inline cache should allocate the spill region");
+        assert_eq!(spilled.len(), list_count - INLINE_RENDER_FRAGMENT_LISTS);
+        assert!(spilled[0].get().is_some());
+        assert!(resolved.list(list_count - 1).is_some());
+
+        for (id, source) in &protocol.protocol().fragments {
+            let prepared = resolved
+                .list_by_id(id)
+                .unwrap_or_else(|| panic!("render plan should contain {id}"));
+            // Borrowed, never duplicated: the prepared list points at protocol storage.
+            assert!(std::ptr::eq(
+                prepared.fragments.as_ptr(),
+                source.fragments.as_ptr()
+            ));
+        }
     }
 
     #[test]

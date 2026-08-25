@@ -404,12 +404,17 @@ mod tests {
         let mut writer = NullSink;
         let mut context = WebUIProcessContext {
             protocol: protocol.protocol(),
+            render_fragments: protocol.render_fragments().resolve(protocol.protocol()),
             component_asset_style_manifest: protocol.component_asset_style_manifest()?,
             component_asset_style_links: protocol.component_asset_style_links(),
             state: &state,
             writer: &mut writer,
             local_vars: HashMap::new(),
+            local_borrowed_vars: crate::BorrowedScope::default(),
+            loop_vars: Vec::new(),
+            visible_loop_scope: crate::VisibleLoopScope::EMPTY,
             component_attrs: HashMap::new(),
+            component_borrowed_attrs: crate::BorrowedScope::default(),
             collecting_component_attrs: false,
             request_path: "/account/details",
             route_base: std::borrow::Cow::Borrowed("/account"),
@@ -439,6 +444,7 @@ mod tests {
             scope_pool: Vec::new(),
             document_style_resources: HashSet::new(),
             shadow_style_roots: Vec::new(),
+            borrowed_scope_pool: Vec::new(),
         };
 
         record_checkpoint_tag(&mut context, "route-shell");
