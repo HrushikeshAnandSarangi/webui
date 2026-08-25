@@ -4555,6 +4555,20 @@ Generated esbuild entries live in a targeted temporary directory beneath the
 site output, keeping projection inputs and outputs on the project volume. The
 directory is removed after that bundle completes.
 
+The WebUI Press template may declare compile-time extension regions with
+`<webui-press-region name="..." layout="...">fallback HTML</webui-press-region>`.
+Child markup is the default; matching site configuration may replace it with
+inline or file-backed HTML, clear it with an empty inline value, or retain it
+while adding page-local state and an optional script. The builder substitutes
+regions before component discovery and protocol compilation, so default and
+replacement components retain ordinary SSR, CSS, projection, and bundling
+behavior. Dotted names map state beneath the reserved `regions` object, and
+layout-qualified declarations inject only into pages of that layout.
+State-bearing names cannot overlap as dotted prefixes, while HTML-only prefix
+names remain valid. Full template replacement remains an escape hatch.
+The bundled template's `site.*`, `home.*`, `doc.*`, `page.*`, and `full.*`
+region names are stable extension points documented by WebUI Press.
+
 Before the projection barrier releases page rendering, press publishes the
 generated root/page output identities and an exact identity-to-served-URL map.
 The compiler consumes each manifest's already ordered static-import closure and

@@ -326,14 +326,81 @@ components and Markdown-authored custom elements can bind to it directly:
 
 Shared state cannot override reserved docs keys such as `site`, `navigation`,
 `sidebar`, `page`, `hero`, `footer`, `prev`, `next`, `pageData`,
-`headTags`, `tokens`, `label`, or `icon`. Global state is applied first. Custom page
-state is applied afterward for that page, so non-reserved custom page keys can
-override global keys.
+`regions`, `headTags`, `tokens`, `label`, or `icon`. Global state is applied
+first. Custom page state is applied afterward for that page, so non-reserved
+custom page keys can override global keys.
 
 The merged render state is embedded into each generated page's `#webui-data`
 hydration block. Do not put secrets in `state` or `stateFile`, and keep shared
 state small. Large global JSON files are duplicated into every output page; use
 custom page state or static JSON assets for large page-specific datasets.
+
+### Compile-time named regions
+
+Templates expose stable extension points without requiring a full template fork:
+
+```html
+<webui-press-region
+  name="home.afterHero"
+  layout="home"
+>
+  <h2>After the hero</h2>
+</webui-press-region>
+```
+
+Sites provide the content in `config.json`:
+
+```json
+{
+  "regions": {
+    "home.afterHero": {
+      "htmlFile": "./regions/home-after-hero.html",
+      "stateFile": "./state/home-summary.json"
+    }
+  }
+}
+```
+
+Child markup is the default. A matching `regions` entry can replace it with
+`html` or `htmlFile`; omit both to keep the default while adding `state`,
+`stateFile`, or `scriptFile`. Use `html: ""` to clear it. `layout` limits the
+marker to one page layout; omit it for every layout. Dotted names create nested
+state:
+
+```html
+<project-summary :data="{{regions.home.afterHero}}"></project-summary>
+```
+
+Default and replacement components participate normally in SSR, CSS, projection,
+and bundling. A self-closing unconfigured marker is empty; a configured but
+undeclared name fails the build. State-bearing dotted names cannot overlap as
+prefixes.
+
+The bundled template exposes these stable regions:
+
+| Region | Layout | Default |
+| --- | --- | --- |
+| `site.navigation` | all | Logo and site navigation |
+| `site.announcement` | all | Empty announcement/banner slot |
+| `home.hero` | `home` | Hero, actions, and manifesto |
+| `home.afterHero` | `home` | Empty slot after the hero |
+| `home.features` | `home` | Feature card grid |
+| `home.footer` | `home` | Site footer |
+| `doc.sidebar` | `doc` | Documentation sidebar |
+| `doc.context` | `doc` | Mobile current-location context |
+| `doc.beforeContent` | `doc` | Empty slot before the article |
+| `doc.afterContent` | `doc` | Empty slot after the article |
+| `doc.pageNavigation` | `doc` | Previous/next links |
+| `doc.footer` | `doc` | Site footer |
+| `page.beforeContent` | `page` | Empty slot before wide content |
+| `page.afterContent` | `page` | Empty slot after wide content |
+| `page.footer` | `page` | Wide page footer |
+| `full.beforeContent` | `full` | Empty slot before viewport content |
+| `full.afterContent` | `full` | Empty slot after viewport content |
+
+`home.*` regions belong to the generated home page. A `customPages` entry with
+`layout: "home"` keeps the existing non-home shell and therefore uses `doc.*`
+regions.
 
 ### `head` injection
 
