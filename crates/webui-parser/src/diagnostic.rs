@@ -99,8 +99,9 @@ pub mod codes {
     pub const LIGHT_SCOPE_COLLISION: &str = "light-scope-collision";
     /// Light component CSS contains a Shadow-only selector.
     pub const UNSUPPORTED_LIGHT_CSS: &str = "unsupported-light-css";
-    /// A FAST plugin was asked to compile a Light DOM component it cannot mount faithfully.
-    pub const FAST_LIGHT_DOM_UNSUPPORTED: &str = "fast-light-dom-unsupported";
+    /// Compatibility alias for the FAST-owned Light DOM diagnostic code.
+    pub const FAST_LIGHT_DOM_UNSUPPORTED: &str =
+        crate::plugin::fast::diagnostic::FAST_LIGHT_DOM_UNSUPPORTED;
     /// Legacy code for removed Light-local keyframe namespacing.
     #[deprecated(note = "Light DOM no longer namespaces component-local keyframes")]
     pub const DYNAMIC_LIGHT_KEYFRAME: &str = "dynamic-light-keyframe";

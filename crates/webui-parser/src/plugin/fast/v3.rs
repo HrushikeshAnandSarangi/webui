@@ -1,26 +1,23 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-//! FAST 2 parser plugin for the WebUI parser.
+//! FAST 3 parser plugin for the WebUI parser.
 //!
 //! Tracks component definitions during HTML parsing and returns `<f-template>`
 //! artifacts after parsing. Converts WebUI Framework template syntax (`<if>`, `<for>`, `{{}}`)
 //! into FAST-compatible syntax (`<f-when>`, `<f-repeat>`, `{}`).
 
-use super::fast_v3::{
-    build_f_template, f_template_style_injection, require_fast_shadow_dom, strip_shadowrootmode,
-    style_injection_snippet,
-};
-use super::{
-    AttributeAction, ComponentTemplateArtifact, ComponentTemplateContext, ParserPlugin,
+use super::super::{
+    AttributeAction, AttributeContext, ComponentBuildContext, ComponentProcessing,
+    ComponentStyleDelivery, ComponentTemplateArtifact, ElementStartContext, ParserPlugin,
     ParserPluginArtifacts,
 };
+#[cfg(test)]
 use crate::component_registry::Component;
 use crate::html_parser::{
-    find_element_end, find_tag_close, opening_tag_name, starts_with_html_tag_name,
+    find_element_end, find_tag_close, leading_content, opening_tag_name, starts_with_html_tag_name,
 };
 use crate::{CssLinkOptions, CssStrategy, Result};
-use webui_protocol::FastElementData;
 
 /// Information about a tracked component for `<f-template>` generation.
 struct TrackedComponent {
@@ -33,22 +30,23 @@ struct TrackedComponent {
     /// WebUI's style registry, so a Shadow component's CSS has to travel with
     /// the template that creates the root.
     style_injection: Option<String>,
+    styles_at_end: bool,
 }
 
-/// Deprecated FAST 2 parser plugin used by `fast` and `fast-v2`.
+/// FAST parser plugin pinned to FAST major version 3.
 ///
-/// Implements the `ParserPlugin` trait for FAST 2 compatibility:
+/// Implements the `ParserPlugin` trait for FAST 3 applications:
 /// - Filters FAST-specific runtime binding attributes (`@click`, `f-ref`, etc.)
 /// - Tracks components encountered during parsing
 /// - Returns `<f-template>` artifacts with converted FAST syntax after parsing
 /// - Emits binding attribute counts as `Plugin` protocol fragment data
-pub struct FastV2ParserPlugin {
+pub struct FastV3ParserPlugin {
     /// Components tracked during parsing, in discovery order.
     components: Vec<TrackedComponent>,
 }
 
-impl FastV2ParserPlugin {
-    /// Create a new FAST 2 parser plugin.
+impl FastV3ParserPlugin {
+    /// Create a new FAST 3 parser plugin.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -69,8 +67,12 @@ impl FastV2ParserPlugin {
                 let tmpl = build_f_template(
                     &comp.tag_name,
                     &convert_btr_to_fast(&comp.template_html),
-                    comp.style_injection.as_deref(),
-                    None,
+                    &super::shared::hoisted_shadow_options(&comp.template_html),
+                    FastTemplateStyle {
+                        injection: comp.style_injection.as_deref(),
+                        module_specifier: None,
+                        at_end: comp.styles_at_end,
+                    },
                 );
                 ComponentTemplateArtifact::template(
                     comp.tag_name.clone(),
@@ -81,90 +83,85 @@ impl FastV2ParserPlugin {
             .collect()
     }
 
-    fn track_component(
-        &mut self,
-        tag_name: &str,
-        processed_template: &str,
-        context: ComponentTemplateContext<'_>,
-    ) {
+    fn track_component(&mut self, context: ComponentBuildContext<'_>) {
+        let tag_name = context.component.tag_name.as_str();
         if self.components.iter().any(|c| c.tag_name == tag_name) {
             return;
         }
         self.components.push(TrackedComponent {
             tag_name: tag_name.to_string(),
-            template_html: processed_template.to_string(),
+            template_html: context.template.to_string(),
             uses_shadow_dom: context.uses_shadow_dom,
             style_injection: context.style.and_then(style_injection_snippet),
+            styles_at_end: matches!(context.style, Some(ComponentStyleDelivery::Inline { .. })),
         });
     }
 
     #[cfg(test)]
     fn register_component_template(
         &mut self,
-        tag_name: &str,
+        _tag_name: &str,
         component: &Component,
         processed_template: &str,
     ) -> Result<()> {
-        <Self as ParserPlugin>::register_component_template(
+        <Self as ParserPlugin>::component_built(
             self,
-            tag_name,
-            component,
-            processed_template,
-            ComponentTemplateContext {
+            ComponentBuildContext {
+                component,
+                template: processed_template,
                 uses_shadow_dom: true,
                 style: None,
             },
         )
     }
+
+    #[cfg(test)]
+    fn classify_attribute(&mut self, name: &str) -> AttributeAction {
+        <Self as ParserPlugin>::process_attribute(self, AttributeContext { name })
+    }
+
+    #[cfg(test)]
+    fn finish_element(&mut self, binding_count: u32) -> Option<Vec<u8>> {
+        <Self as ParserPlugin>::finish_opening_tag(
+            self,
+            ElementStartContext {
+                tag_name: "test-element",
+                binding_count,
+            },
+        )
+    }
 }
 
-impl Default for FastV2ParserPlugin {
+impl Default for FastV3ParserPlugin {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl ParserPlugin for FastV2ParserPlugin {
-    fn register_component_template(
-        &mut self,
-        tag_name: &str,
-        component: &Component,
-        processed_template: &str,
-        context: ComponentTemplateContext<'_>,
-    ) -> Result<()> {
-        require_fast_shadow_dom(tag_name, context)?;
-        self.track_component(tag_name, processed_template, context);
-        let _ = component;
+impl ParserPlugin for FastV3ParserPlugin {
+    fn component_processing(&self) -> ComponentProcessing {
+        ComponentProcessing {
+            source_transform: Some(super::shared::transform_component_source),
+            process_root_template_attributes: true,
+            inline_styles_after_content: true,
+        }
+    }
+
+    fn component_built(&mut self, context: ComponentBuildContext<'_>) -> Result<()> {
+        require_fast_shadow_dom(context.component.tag_name.as_str(), context.uses_shadow_dom)?;
+        self.track_component(context);
         Ok(())
     }
 
-    fn classify_attribute(&mut self, attr_name: &str) -> AttributeAction {
-        if attr_name.starts_with('@')
-            || attr_name == "f-ref"
-            || attr_name == "f-slotted"
-            || attr_name == "f-children"
-        {
-            AttributeAction::SkipAndCountBinding
-        } else {
-            AttributeAction::Keep
-        }
+    fn process_attribute(&mut self, context: AttributeContext<'_>) -> AttributeAction {
+        super::shared::classify_attribute(context.name)
     }
 
-    fn finish_element(&mut self, binding_attribute_count: u32) -> Option<Vec<u8>> {
-        if binding_attribute_count > 0 {
-            Some(
-                FastElementData {
-                    binding_count: binding_attribute_count,
-                }
-                .encode()
-                .to_vec(),
-            )
-        } else {
-            None
-        }
+    fn finish_opening_tag(&mut self, context: ElementStartContext<'_>) -> Option<Vec<u8>> {
+        super::shared::finish_element(context.binding_count)
     }
 
-    fn into_artifacts(self: Box<Self>) -> Result<ParserPluginArtifacts> {
+    fn finish(self: Box<Self>) -> Result<ParserPluginArtifacts> {
         Ok(ParserPluginArtifacts::ComponentTemplates(
             self.take_component_templates(),
         ))
@@ -194,7 +191,163 @@ pub fn generate_f_template(
     )
 }
 
-/// Generate a FAST 2 f-template with Link CSS filename/href options.
+#[cfg(test)]
+fn generate_f_template_from_processed(tag_name: &str, processed_template: &str) -> String {
+    build_f_template(
+        tag_name,
+        &convert_btr_to_fast(processed_template),
+        &super::shared::hoisted_shadow_options(processed_template),
+        FastTemplateStyle::default(),
+    )
+}
+
+/// Build the inline style snippet FAST keeps inside a component's shadow root.
+///
+/// `Adopted` needs no snippet: the parser already recorded the specifier on the
+/// template's `shadowrootadoptedstylesheets` attribute.
+pub(super) fn style_injection_snippet(style: ComponentStyleDelivery<'_>) -> Option<String> {
+    match style {
+        ComponentStyleDelivery::Link { href } => {
+            let mut link = String::with_capacity(30 + href.len());
+            link.push_str("<link rel=\"stylesheet\" href=\"");
+            link.push_str(href);
+            link.push_str("\">");
+            Some(link)
+        }
+        ComponentStyleDelivery::Inline { css } => {
+            let trimmed = css.trim();
+            let mut style = String::with_capacity(15 + trimmed.len());
+            style.push_str("<style>");
+            push_style_text(&mut style, trimmed);
+            style.push_str("</style>");
+            Some(style)
+        }
+        ComponentStyleDelivery::Adopted { .. } => None,
+    }
+}
+
+/// Append CSS inside an HTML raw-text element without permitting `</style`
+/// (ASCII case-insensitive) to terminate the element.
+fn push_style_text(output: &mut String, css: &str) {
+    let bytes = css.as_bytes();
+    let mut chunk_start = 0usize;
+    let mut index = 0usize;
+    while index + 7 <= bytes.len() {
+        if bytes[index] == b'<'
+            && bytes[index + 1] == b'/'
+            && bytes[index + 2].eq_ignore_ascii_case(&b's')
+            && bytes[index + 3].eq_ignore_ascii_case(&b't')
+            && bytes[index + 4].eq_ignore_ascii_case(&b'y')
+            && bytes[index + 5].eq_ignore_ascii_case(&b'l')
+            && bytes[index + 6].eq_ignore_ascii_case(&b'e')
+        {
+            output.push_str(&css[chunk_start..index + 1]);
+            output.push_str("\\/");
+            chunk_start = index + 2;
+            index += 7;
+        } else {
+            index += 1;
+        }
+    }
+    output.push_str(&css[chunk_start..]);
+}
+
+/// Serialize one `<f-template>`, injecting `css_injection` inside the root
+/// `<template>` when present.
+///
+/// `converted_html` is already in the caller's FAST dialect, which is what lets
+/// both FAST versions share this serializer.
+///
+/// `module_specifier` adds `shadowrootadoptedstylesheets` when this function
+/// synthesizes the wrapper; templates that already went through the parser
+/// carry it verbatim and pass `None`.
+#[derive(Default)]
+pub(super) struct FastTemplateStyle<'a> {
+    pub(super) injection: Option<&'a str>,
+    pub(super) module_specifier: Option<&'a str>,
+    pub(super) at_end: bool,
+}
+
+pub(super) fn build_f_template(
+    tag_name: &str,
+    converted_html: &str,
+    hoisted_shadow_options: &str,
+    style: FastTemplateStyle<'_>,
+) -> String {
+    let mut output = String::with_capacity(256);
+    output.push_str("<f-template name=\"");
+    output.push_str(tag_name);
+    output.push('"');
+    // Hoist declarative-shadow-root options (shadowrootmode,
+    // shadowrootdelegatesfocus, …) from the inner <template> onto the
+    // <f-template> wrapper, where the FAST runtime reads them.
+    output.push_str(hoisted_shadow_options);
+    output.push_str(">\n");
+
+    let trimmed = minify_inter_tag_whitespace(converted_html.trim());
+    let (trimmed, _) = leading_content(&trimmed);
+
+    if starts_with_html_tag_name(trimmed, "template") {
+        if let Some(close_pos) = find_tag_close(trimmed) {
+            // Dev owns the wrapper — preserve attributes verbatim.
+            // For `CssStrategy::Module` the parser pass enforces
+            // `shadowrootadoptedstylesheets`, so by the time we get here
+            // either the dev wrote it or the build already failed.
+            output.push_str(&trimmed[..close_pos]);
+            output.push('>');
+            super::shared::push_body_with_css_injection(
+                &mut output,
+                &trimmed[close_pos + 1..],
+                style.injection,
+                style.at_end,
+            );
+        } else {
+            output.push_str(trimmed);
+        }
+    } else {
+        output.push_str("<template");
+        if let Some(specifier) = style.module_specifier {
+            output.push_str(" shadowrootadoptedstylesheets=\"");
+            output.push_str(specifier);
+            output.push('"');
+        }
+        output.push('>');
+        super::shared::push_body_with_css_injection(
+            &mut output,
+            trimmed,
+            style.injection,
+            style.at_end,
+        );
+        output.push_str("</template>");
+    }
+
+    output.push_str("\n</f-template>\n");
+    output
+}
+
+/// Resolve the root-`<template>` style injection and adopted-stylesheet
+/// specifier a compiled component needs, shared by both FAST versions.
+pub(super) fn f_template_style_injection<'a>(
+    tag_name: &'a str,
+    css_content: Option<&str>,
+    css_strategy: CssStrategy,
+    css_link_options: &CssLinkOptions,
+) -> (Option<String>, Option<&'a str>) {
+    let css_injection = css_content.and_then(|css| match css_strategy {
+        CssStrategy::Link => style_injection_snippet(ComponentStyleDelivery::Link {
+            href: &css_link_options.resolve(tag_name, css).href,
+        }),
+        CssStrategy::Style => style_injection_snippet(ComponentStyleDelivery::Inline { css }),
+        CssStrategy::Module => None,
+    });
+    let module_specifier = match css_strategy {
+        CssStrategy::Module if css_content.is_some() => Some(tag_name),
+        _ => None,
+    };
+    (css_injection, module_specifier)
+}
+
+/// Generate a FAST 3 f-template with Link CSS filename/href options.
 pub fn generate_f_template_with_css_options(
     tag_name: &str,
     html_content: &str,
@@ -208,22 +361,16 @@ pub fn generate_f_template_with_css_options(
     build_f_template(
         tag_name,
         &convert_btr_to_fast(html_content),
-        css_injection.as_deref(),
-        module_specifier,
+        &super::shared::hoisted_shadow_options(html_content),
+        FastTemplateStyle {
+            injection: css_injection.as_deref(),
+            module_specifier,
+            at_end: css_strategy == CssStrategy::Style,
+        },
     )
 }
 
-/// Convert WebUI Framework template syntax to FAST syntax in HTML content.
-///
-/// Performs the following transformations without regex:
-/// - `<if condition="EXPR">` → `<f-when value="{{EXPR}}">`
-/// - `</if>` → `</f-when>`
-/// - `<for each="EXPR">` → `<f-repeat value="{{EXPR}}">`
-/// - `</for>` → `</f-repeat>`
-/// - `{{expr}}` inside `:attr` complex attribute values → `{expr}`
-/// - Strips `shadowrootmode` attributes from `<template>` tags
-///   (in f-template context, shadowrootmode must be removed to prevent
-///   the browser from auto-activating it as a declarative shadow root)
+// Convert WebUI directives and bindings to FAST syntax.
 fn convert_btr_to_fast(input: &str) -> String {
     let mut result = String::with_capacity(input.len());
     let bytes = input.as_bytes();
@@ -298,8 +445,8 @@ fn try_convert_tag(input: &str, pos: usize, result: &mut String) -> Option<usize
     // Check for tags with :attr="{{expr}}" complex attribute values
     if remaining.starts_with("<") {
         // Strip shadowrootmode from <template> tags
-        if starts_with_html_tag_name(remaining, "template") {
-            if let Some(consumed) = strip_shadowrootmode(remaining, result) {
+        if starts_with_tag_name(remaining, "template") {
+            if let Some(consumed) = super::shared::strip_hoisted_shadow_options(remaining, result) {
                 return Some(consumed);
             }
         }
@@ -313,7 +460,7 @@ fn try_convert_tag(input: &str, pos: usize, result: &mut String) -> Option<usize
 
 /// Check if `s` starts with `<name` followed by whitespace or `>`.
 fn starts_with_tag_name(s: &str, name: &str) -> bool {
-    opening_tag_name(s).is_some_and(|tag_name| tag_name == name)
+    opening_tag_name(s).is_some_and(|tag_name| tag_name.eq_ignore_ascii_case(name))
 }
 
 /// Convert `<if condition="EXPR">` to `<f-when value="{{EXPR}}">`.
@@ -537,11 +684,52 @@ fn is_whitespace(b: u8) -> bool {
     b == b' ' || b == b'\t' || b == b'\n' || b == b'\r'
 }
 
+/// Collapse whitespace-only text between `>` and `<` to eliminate extra DOM
+/// text nodes that would shift element indices during hydration.
+/// This ensures the f-template DOM structure matches the minified DSD output.
+fn minify_inter_tag_whitespace(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'>' && i + 1 < len {
+            result.push('>');
+            i += 1;
+            // Skip whitespace-only content between > and <
+            let ws_start = i;
+            while i < len && is_whitespace(bytes[i]) {
+                i += 1;
+            }
+            // If we hit '<', the whitespace was inter-tag — drop it
+            // If we hit non-'<', it's meaningful text — keep it
+            if i >= len || bytes[i] != b'<' {
+                // Keep the whitespace (it's before text content)
+                result.push_str(&input[ws_start..i]);
+            }
+        } else {
+            i = push_char_at(input, i, &mut result);
+        }
+    }
+
+    result
+}
+
+pub(super) fn require_fast_shadow_dom(tag_name: &str, uses_shadow_dom: bool) -> Result<()> {
+    if uses_shadow_dom {
+        return Ok(());
+    }
+    Err(super::diagnostic::light_dom_unsupported(tag_name))
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::disallowed_methods)]
 
     use super::*;
+    use crate::diagnostic::codes;
+    use crate::ParserError;
     fn make_component(tag: &str, html: &str, css: Option<&str>) -> Component {
         Component {
             tag_name: tag.to_string(),
@@ -557,7 +745,7 @@ mod tests {
 
     #[test]
     fn skip_event_binding() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         assert_eq!(
             plugin.classify_attribute("@click"),
             AttributeAction::SkipAndCountBinding
@@ -574,7 +762,7 @@ mod tests {
 
     #[test]
     fn skip_f_ref() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         assert_eq!(
             plugin.classify_attribute("f-ref"),
             AttributeAction::SkipAndCountBinding
@@ -583,7 +771,7 @@ mod tests {
 
     #[test]
     fn skip_f_slotted() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         assert_eq!(
             plugin.classify_attribute("f-slotted"),
             AttributeAction::SkipAndCountBinding
@@ -592,7 +780,7 @@ mod tests {
 
     #[test]
     fn skip_f_children() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         assert_eq!(
             plugin.classify_attribute("f-children"),
             AttributeAction::SkipAndCountBinding
@@ -600,15 +788,27 @@ mod tests {
     }
 
     #[test]
+    fn skip_property_binding() {
+        let mut plugin = FastV3ParserPlugin::new();
+        assert_eq!(
+            plugin.classify_attribute(":title"),
+            AttributeAction::SkipAndCountBinding
+        );
+        assert_eq!(
+            plugin.classify_attribute(":config"),
+            AttributeAction::SkipAndCountBinding
+        );
+    }
+
+    #[test]
     fn do_not_skip_normal_attributes() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         assert_eq!(plugin.classify_attribute("class"), AttributeAction::Keep);
         assert_eq!(plugin.classify_attribute("id"), AttributeAction::Keep);
         assert_eq!(
             plugin.classify_attribute("data-value"),
             AttributeAction::Keep
         );
-        assert_eq!(plugin.classify_attribute(":title"), AttributeAction::Keep);
         assert_eq!(plugin.classify_attribute("f-other"), AttributeAction::Keep);
     }
 
@@ -616,13 +816,13 @@ mod tests {
 
     #[test]
     fn element_parsed_zero_count_returns_none() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         assert!(plugin.finish_element(0).is_none());
     }
 
     #[test]
     fn element_parsed_nonzero_count_returns_le_bytes() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let data = plugin.finish_element(3);
         assert!(data.is_some());
         let bytes = data.as_deref().unwrap_or_default();
@@ -631,7 +831,7 @@ mod tests {
 
     #[test]
     fn element_parsed_large_count() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let data = plugin.finish_element(256);
         assert!(data.is_some());
         let bytes = data.as_deref().unwrap_or_default();
@@ -640,7 +840,7 @@ mod tests {
 
     #[test]
     fn component_template_simple_component() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let comp = make_component("my-comp", "<div>hello</div>", Some("div { color: red; }"));
         plugin
             .register_component_template(
@@ -665,7 +865,7 @@ mod tests {
 
     #[test]
     fn component_template_without_css() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let comp = make_component("no-css", "<span>text</span>", None);
         plugin
             .register_component_template("no-css", &comp, &comp.html_content)
@@ -700,7 +900,7 @@ mod tests {
 
     #[test]
     fn component_template_css_strategy_style() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let comp = make_component("my-comp", "<div>hello</div>", Some("div { color: red; }"));
         plugin
             .register_component_template(
@@ -723,9 +923,138 @@ mod tests {
         );
     }
 
+    // --- Style strategy: <style> trails the template body (FAST TemplateParser
+    // brace-scan safety). FAST's declarative parser reads the client
+    // `<f-template>` body for `{`/`}` bindings; raw CSS rule blocks otherwise
+    // corrupt the next real binding. Placing the `<style>` after every binding
+    // keeps them aligned while preserving the CSS byte-for-byte. ---
+
+    #[test]
+    fn style_strategy_trails_style_after_bindings_and_body() {
+        // A brace-bearing directive binding (`f-ref="{start}"`) plus a host
+        // event binding must both precede the injected `<style>`.
+        let out = generate_f_template_with_css_options(
+            "my-btn",
+            r#"<template @click="{click($e)}"><slot name="start" f-ref="{start}"></slot><span>x</span></template>"#,
+            Some("@media screen { :host { color: red; } } .content { display: inherit; }"),
+            CssStrategy::Style,
+            &CssLinkOptions::default(),
+        );
+        let style_at = out.find("<style>").expect("style present");
+        let close_at = out.rfind("</template>").expect("template close present");
+        let style_end = out.find("</style>").expect("style end present") + "</style>".len();
+        // <style> sits after every binding and immediately before </template>.
+        assert!(
+            out.find("f-ref=").expect("f-ref present") < style_at,
+            "f-ref binding must precede the <style>: {out}"
+        );
+        assert!(
+            out.find("@click=").expect("@click present") < style_at,
+            "@click binding must precede the <style>: {out}"
+        );
+        assert!(
+            out[style_end..close_at].trim().is_empty(),
+            "nothing but the <style> may sit between the body and </template>: {out}"
+        );
+    }
+
+    #[test]
+    fn style_strategy_preserves_braces_at_rules_and_custom_properties() {
+        // Nested at-rules, custom properties, and var() fallbacks with braces
+        // survive byte-for-byte inside the trailing <style>.
+        let css = concat!(
+            ":host { --icon-spacing: var(--space, 4px); display: inline-flex; }\n",
+            "@media (forced-colors: active) { :host { color: CanvasText; } }\n",
+            "@supports (display: grid) { .grid { display: grid; } }",
+        );
+        let out = generate_f_template_with_css_options(
+            "my-btn",
+            r#"<template><slot f-slotted="{slotted}"></slot></template>"#,
+            Some(css),
+            CssStrategy::Style,
+            &CssLinkOptions::default(),
+        );
+        let expected = format!("<style>{css}</style>");
+        assert!(
+            out.contains(&expected),
+            "CSS (braces, at-rules, custom props) must be byte-preserved: {out}"
+        );
+        assert!(
+            out.find("f-slotted=").expect("binding present") < out.find("<style>").expect("style"),
+            "binding must precede the trailing <style>: {out}"
+        );
+    }
+
+    #[test]
+    fn style_strategy_preserves_braces_in_css_strings_and_comments() {
+        // Braces inside CSS strings/comments and `</template>`-like text must
+        // survive verbatim and must not be treated as bindings or confuse the
+        // trailing-injection anchor (which never scans the CSS itself).
+        let css = concat!(
+            r#".a::after { content: "}"; } /* a { brace } in a comment */"#,
+            "\n",
+            r#".b::before { content: "</template>"; }"#,
+        );
+        let out = generate_f_template_with_css_options(
+            "my-btn",
+            r#"<template><slot f-ref="{end}"></slot></template>"#,
+            Some(css),
+            CssStrategy::Style,
+            &CssLinkOptions::default(),
+        );
+        let expected = format!("<style>{css}</style>");
+        assert!(
+            out.contains(&expected),
+            "CSS string/comment braces and end-tag-like text must be byte-preserved: {out}"
+        );
+        // The trailing `<style>` (with its `</template>`-like CSS text safely
+        // inside) sits immediately before the real inner-template close: the
+        // injection anchor scans the body, never the CSS, so end-tag-like CSS
+        // text cannot shift it.
+        assert!(
+            out.contains("</style></template>"),
+            "the <style> must be the last body node before </template>: {out}"
+        );
+        assert!(
+            out.find("f-ref=").expect("binding present") < out.find("<style>").expect("style"),
+            "binding must precede the trailing <style>: {out}"
+        );
+    }
+
+    #[test]
+    fn link_strategy_injection_stays_at_template_start() {
+        // Link injections carry no CSS braces, so they keep their opening-tag
+        // position — only the Style strategy trails the body.
+        let out = generate_f_template_with_css_options(
+            "my-btn",
+            r#"<template><slot f-ref="{start}"></slot></template>"#,
+            Some("div { color: red; }"),
+            CssStrategy::Link,
+            &CssLinkOptions::default(),
+        );
+        assert!(out.contains(r#"<link rel="stylesheet" href="my-btn.css">"#));
+        assert!(
+            out.find("<link").expect("link present") < out.find("f-ref=").expect("binding present"),
+            "Link stays ahead of the body (unchanged placement): {out}"
+        );
+    }
+
+    #[test]
+    fn inline_component_css_cannot_terminate_the_style_element() {
+        let snippet = style_injection_snippet(ComponentStyleDelivery::Inline {
+            css: ".a{content:'</StYlE>'}</template><img src=x onerror=alert(1)>",
+        })
+        .expect("inline style snippet");
+
+        assert_eq!(
+            snippet,
+            "<style>.a{content:'<\\/StYlE>'}</template><img src=x onerror=alert(1)></style>"
+        );
+    }
+
     #[test]
     fn component_template_css_strategy_module() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let comp = make_component("my-comp", "<div>hello</div>", Some("div { color: red; }"));
         plugin
             .register_component_template(
@@ -767,7 +1096,7 @@ mod tests {
 
     #[test]
     fn component_template_css_strategy_module_no_css() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let comp = make_component("my-comp", "<div>hello</div>", None);
         plugin
             .register_component_template(
@@ -792,7 +1121,7 @@ mod tests {
 
     #[test]
     fn component_template_multiple_components() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let comp1 = make_component("comp-a", "<div>A</div>", None);
         let comp2 = make_component("comp-b", "<div>B</div>", Some("b { }"));
         plugin
@@ -819,7 +1148,7 @@ mod tests {
 
     #[test]
     fn component_template_deduplicates_same_component() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let comp = make_component(
             "my-button",
             "<button><slot></slot></button>",
@@ -850,7 +1179,7 @@ mod tests {
 
     #[test]
     fn component_template_deduplicates_mixed_components() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let btn = make_component("my-button", "<button><slot></slot></button>", None);
         let card = make_component("my-card", "<div><slot></slot></div>", Some(".card{}"));
 
@@ -968,7 +1297,7 @@ mod tests {
 
     #[test]
     fn component_template_with_btr_conversion() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let html = r#"<div><if condition="visible"><span>hi</span></if></div>"#;
         let comp = make_component("my-widget", html, None);
         plugin
@@ -1007,7 +1336,7 @@ mod tests {
 
     #[test]
     fn outlet_marker_in_component_template() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let html =
             r#"<template shadowrootmode="open"><h1>Title</h1><main><outlet /></main></template>"#;
         let comp = make_component("my-shell", html, None);
@@ -1038,15 +1367,24 @@ mod tests {
     }
 
     #[test]
+    fn shadow_mode_stripping_preserves_unrelated_attribute_bytes() {
+        let input = "<TEMPLATE SHADOWROOTMODE = 'open' aria-label='keep shadowrootmode word' data-x = \"y\">";
+        let output = convert_btr_to_fast(input);
+        assert_eq!(
+            output,
+            "<TEMPLATE aria-label='keep shadowrootmode word' data-x = \"y\">"
+        );
+    }
+
+    #[test]
     fn rejects_effective_light_dom() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let component = make_component("my-card", "<p>content</p>", None);
-        let error = <FastV2ParserPlugin as ParserPlugin>::register_component_template(
+        let error = <FastV3ParserPlugin as ParserPlugin>::component_built(
             &mut plugin,
-            "my-card",
-            &component,
-            component.html_content.as_str(),
-            ComponentTemplateContext {
+            ComponentBuildContext {
+                component: &component,
+                template: component.html_content.as_str(),
                 uses_shadow_dom: false,
                 style: None,
             },
@@ -1054,8 +1392,8 @@ mod tests {
         .expect_err("FAST cannot mount Light DOM faithfully");
         assert!(matches!(
             error,
-            crate::ParserError::Template(ref diagnostic)
-                if diagnostic.error_code() == Some(crate::diagnostic::codes::FAST_LIGHT_DOM_UNSUPPORTED)
+            ParserError::Template(ref diagnostic)
+                if diagnostic.error_code() == Some(codes::FAST_LIGHT_DOM_UNSUPPORTED)
         ));
     }
 
@@ -1078,7 +1416,7 @@ mod tests {
 
     #[test]
     fn component_template_strips_shadowrootmode_from_f_template() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let comp = make_component(
             "my-comp",
             r#"<template shadowrootmode="open" @click="{onClick(e)}"><div>{{title}}</div></template>"#,
@@ -1092,12 +1430,151 @@ mod tests {
         let name = &templates[0].tag_name;
         let html = &templates[0].template;
         assert_eq!(name, "my-comp");
-        // f-template content should NOT have shadowrootmode
-        assert!(!html.contains("shadowrootmode"));
+        // shadowrootmode is hoisted onto the <f-template> wrapper (where the
+        // FAST runtime reads it), not left on the inner <template>.
+        assert!(html.contains(r#"<f-template name="my-comp" shadowrootmode="open">"#));
+        assert!(!html.contains("<template shadowrootmode"));
         // But should keep @click (framework attr kept in f-template mode)
         assert!(html.contains("@click"));
         // Should have the converted content
         assert!(html.contains("{{title}}"));
+    }
+
+    #[test]
+    fn shadow_options_hoisted_from_inner_template_to_f_template_wrapper() {
+        // The converter bakes the wrapper's shadow-root options onto the inner
+        // <template>; the client artifact generator hoists them back onto the
+        // <f-template> wrapper (where the FAST runtime reads them), strips them
+        // from the inner <template>, and keeps WebUI's CSS-module
+        // shadowrootadoptedstylesheets on the inner template.
+        let processed = concat!(
+            r#"<template shadowrootmode="open" shadowrootdelegatesfocus "#,
+            r#"shadowrootadoptedstylesheets="custom-field" @click="{clickHandler($e)}">"#,
+            r#"<slot></slot></template>"#,
+        );
+        let html = generate_f_template_from_processed("custom-field", processed);
+        assert!(
+            html.contains(
+                r#"<f-template name="custom-field" shadowrootmode="open" shadowrootdelegatesfocus>"#
+            ),
+            "wrapper must carry hoisted shadow options: {html}"
+        );
+        // The inner <template> keeps its bindings and the adopted-stylesheets
+        // CSS delivery, but not the hoisted shadow-root options.
+        assert!(html.contains(r#"@click="{clickHandler($e)}""#));
+        assert!(html.contains(r#"shadowrootadoptedstylesheets="custom-field""#));
+        assert!(
+            !html.contains("<template shadowrootmode"),
+            "inner <template> must not keep shadowrootmode: {html}"
+        );
+        assert!(
+            !html.contains("<template shadowrootdelegatesfocus")
+                && !html.contains(" shadowrootdelegatesfocus shadowrootadopted"),
+            "inner <template> must not keep shadowrootdelegatesfocus: {html}"
+        );
+    }
+
+    #[test]
+    fn delegatesfocus_only_without_mode_is_hoisted_and_stripped() {
+        // Regression for the duplication bug: `shadowrootdelegatesfocus` alone
+        // (no `shadowrootmode`) must still be hoisted onto the wrapper and
+        // removed from the inner <template>, not only when `shadowrootmode`
+        // happens to be present too.
+        let processed = r#"<template shadowrootdelegatesfocus><slot></slot></template>"#;
+        let html = generate_f_template_from_processed("custom-field", processed);
+        assert_eq!(
+            html.matches("shadowrootdelegatesfocus").count(),
+            1,
+            "shadowrootdelegatesfocus must appear exactly once (hoisted, not duplicated): {html}"
+        );
+        assert!(
+            html.contains(r#"<f-template name="custom-field" shadowrootdelegatesfocus>"#),
+            "wrapper must carry the hoisted option: {html}"
+        );
+        assert!(
+            !html.contains("<template shadowrootdelegatesfocus"),
+            "inner <template> must not keep shadowrootdelegatesfocus: {html}"
+        );
+    }
+
+    #[test]
+    fn clonable_and_serializable_only_are_hoisted_and_stripped() {
+        let processed =
+            r#"<template shadowrootclonable shadowrootserializable><slot></slot></template>"#;
+        let html = generate_f_template_from_processed("custom-field", processed);
+        for attr in ["shadowrootclonable", "shadowrootserializable"] {
+            assert_eq!(
+                html.matches(attr).count(),
+                1,
+                "{attr} must appear exactly once (hoisted, not duplicated): {html}"
+            );
+        }
+        assert!(
+            html.contains(
+                r#"<f-template name="custom-field" shadowrootclonable shadowrootserializable>"#
+            ),
+            "wrapper must carry both hoisted options: {html}"
+        );
+        assert!(
+            !html.contains("<template shadowrootclonable")
+                && !html.contains("<template shadowrootserializable"),
+            "inner <template> must not keep either hoisted option: {html}"
+        );
+    }
+
+    #[test]
+    fn adoptedstylesheets_only_is_neither_hoisted_nor_stripped() {
+        let processed =
+            r#"<template shadowrootadoptedstylesheets="custom-field"><slot></slot></template>"#;
+        let html = generate_f_template_from_processed("custom-field", processed);
+        assert!(
+            html.contains("<f-template name=\"custom-field\">"),
+            "shadowrootadoptedstylesheets is not a shadow-root-creation option and must stay off the wrapper: {html}"
+        );
+        assert!(
+            html.contains(r#"<template shadowrootadoptedstylesheets="custom-field">"#),
+            "inner <template> must keep shadowrootadoptedstylesheets: {html}"
+        );
+    }
+
+    #[test]
+    fn mixed_shadow_options_each_appear_exactly_once_and_never_on_inner() {
+        // Every `shadowroot*` option (mode, delegatesfocus, clonable,
+        // serializable) plus WebUI's own shadowrootadoptedstylesheets and an
+        // ordinary binding, all on the same inner <template>. Each hoisted
+        // option must land on the wrapper exactly once and never duplicate
+        // onto the inner template; shadowrootadoptedstylesheets and the
+        // binding must stay on the inner template.
+        let processed = concat!(
+            r#"<template shadowrootmode="open" shadowrootdelegatesfocus shadowrootclonable "#,
+            r#"shadowrootserializable shadowrootadoptedstylesheets="custom-field" "#,
+            r#"@click="{clickHandler($e)}"><slot></slot></template>"#,
+        );
+        let html = generate_f_template_from_processed("custom-field", processed);
+        assert!(
+            html.contains(
+                r#"<f-template name="custom-field" shadowrootmode="open" shadowrootdelegatesfocus shadowrootclonable shadowrootserializable>"#
+            ),
+            "wrapper must carry every hoisted option exactly once, in order: {html}"
+        );
+        assert!(
+            html.contains(
+                r#"<template shadowrootadoptedstylesheets="custom-field" @click="{clickHandler($e)}">"#
+            ),
+            "inner <template> must keep shadowrootadoptedstylesheets and the binding, and nothing hoisted: {html}"
+        );
+        for attr in [
+            "shadowrootmode",
+            "shadowrootdelegatesfocus",
+            "shadowrootclonable",
+            "shadowrootserializable",
+        ] {
+            assert_eq!(
+                html.matches(attr).count(),
+                1,
+                "{attr} must appear exactly once across the wrapper and inner template: {html}"
+            );
+        }
     }
 
     #[test]
@@ -1130,7 +1607,7 @@ mod tests {
 
     #[test]
     fn test_non_js_component_inner_template() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         // A JS component whose HTML contains a non-JS component using
         // declarative shadow DOM (template with shadowrootmode).
         let html = r#"<div><child-comp><template shadowrootmode="open"><p>inner</p></template></child-comp></div>"#;
@@ -1179,7 +1656,7 @@ mod tests {
 
     #[test]
     fn ftemplate_for_loop_converted_to_f_repeat() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let html = r#"<ul><for each="item in items"><li>{{item.name}}</li></for></ul>"#;
         let comp = make_component("my-list", html, None);
         plugin
@@ -1205,7 +1682,7 @@ mod tests {
 
     #[test]
     fn ftemplate_shadow_dom_strips_shadowroot_and_converts_directives() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let html = r#"<template shadowrootmode="open"><div><if condition="visible">Shown</if><for each="x in list"><span>{{x}}</span></for></div></template>"#;
         let comp = make_component("my-shadow", html, None);
         plugin
@@ -1224,8 +1701,12 @@ mod tests {
             "Shadow f-template should contain <f-repeat>, got: {result}"
         );
         assert!(
-            !result.contains("shadowrootmode"),
-            "Shadow f-template should strip shadowrootmode, got: {result}"
+            result.contains(r#"<f-template name="my-shadow" shadowrootmode="open">"#),
+            "shadowrootmode should be hoisted onto the <f-template> wrapper, got: {result}"
+        );
+        assert!(
+            !result.contains("<template shadowrootmode"),
+            "inner <template> should not keep shadowrootmode, got: {result}"
         );
         assert!(
             !result.contains("<if "),
@@ -1239,7 +1720,7 @@ mod tests {
 
     #[test]
     fn ftemplate_nested_if_and_for_both_converted() {
-        let mut plugin = FastV2ParserPlugin::new();
+        let mut plugin = FastV3ParserPlugin::new();
         let html =
             r#"<div><if condition="show"><for each="x in items"><p>{{x}}</p></for></if></div>"#;
         let comp = make_component("my-nested", html, None);
@@ -1287,6 +1768,20 @@ mod tests {
         let input = r#"<if condition="x"><span>✓</span></if>"#;
         let output = convert_btr_to_fast(input);
         assert_eq!(output, r#"<f-when value="{{x}}"><span>✓</span></f-when>"#);
+    }
+
+    #[test]
+    fn minify_preserves_utf8_text_content() {
+        let input = "<span>✓</span><span>✗</span>";
+        let output = minify_inter_tag_whitespace(input);
+        assert_eq!(output, "<span>✓</span><span>✗</span>");
+    }
+
+    #[test]
+    fn minify_preserves_utf8_between_elements() {
+        let input = "<div> ✓ </div>";
+        let output = minify_inter_tag_whitespace(input);
+        assert_eq!(output, "<div> ✓ </div>");
     }
 
     #[test]

@@ -486,6 +486,43 @@ fn tag_is_self_closing(input: &str, close: usize) -> bool {
     input[..close].trim_end().ends_with('/')
 }
 
+// Return true for elements whose bodies must be scanned as opaque text.
+#[inline]
+pub(crate) fn is_raw_text_element(tag_name: &str) -> bool {
+    tag_name.eq_ignore_ascii_case("script")
+        || tag_name.eq_ignore_ascii_case("style")
+        || tag_name.eq_ignore_ascii_case("textarea")
+        || tag_name.eq_ignore_ascii_case("title")
+        || tag_name.eq_ignore_ascii_case("xmp")
+        || tag_name.eq_ignore_ascii_case("iframe")
+        || tag_name.eq_ignore_ascii_case("noembed")
+        || tag_name.eq_ignore_ascii_case("noframes")
+        || tag_name.eq_ignore_ascii_case("noscript")
+        || tag_name.eq_ignore_ascii_case("plaintext")
+}
+
+// Find the end of an opaque raw-text body; `plaintext` consumes the remainder.
+#[inline]
+pub(crate) fn find_raw_text_end(source: &str, tag_name: &str, content_start: usize) -> usize {
+    if tag_name.eq_ignore_ascii_case("plaintext") {
+        return source.len();
+    }
+    let mut cursor = content_start;
+    while cursor < source.len() {
+        let Some(relative) = source[cursor..].find('<') else {
+            return source.len();
+        };
+        cursor += relative;
+        if let Some(tag) = parse_tag(&source[cursor..]) {
+            if tag.closing && tag.name.eq_ignore_ascii_case(tag_name) {
+                return cursor + tag.close + 1;
+            }
+        }
+        cursor += 1;
+    }
+    source.len()
+}
+
 impl<'a> Iterator for Attrs<'a> {
     type Item = Attr<'a>;
 

@@ -2,7 +2,7 @@
 // Licensed under the MIT license.
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use std::hint::black_box;
-use webui_parser::{plugin::fast_v2::FastV2ParserPlugin, CssStrategy, HtmlParser, ParserOptions};
+use webui_parser::{CssStrategy, HtmlParser, ParserOptions};
 
 fn build_simple_template() -> String {
     let mut html = String::with_capacity(256);
@@ -340,12 +340,6 @@ fn parser_with_bench_components_and_options(options: impl Into<ParserOptions>) -
     parser
 }
 
-fn parser_with_bench_components_and_fast_plugin() -> HtmlParser {
-    let mut parser = HtmlParser::with_plugin(Box::new(FastV2ParserPlugin::new()));
-    register_bench_components(&mut parser);
-    parser
-}
-
 fn register_bench_components(parser: &mut HtmlParser) {
     let registry = parser.component_registry_mut();
     registry
@@ -451,32 +445,6 @@ fn parser_parse_fresh_vs_reuse(c: &mut Criterion) {
             parser
                 .parse("index.html", black_box(&input))
                 .unwrap_or_else(|error| panic!("reuse parse failed: {error}"));
-        });
-    });
-
-    group.finish();
-}
-
-fn parser_plugin_bench(c: &mut Criterion) {
-    let mut group = c.benchmark_group("parser_plugin_fast");
-    let input = build_attribute_heavy_template(120);
-    group.throughput(Throughput::Bytes(input.len() as u64));
-
-    group.bench_function("without_plugin", |b| {
-        let mut parser = parser_with_bench_components();
-        b.iter(|| {
-            parser
-                .parse("index.html", black_box(&input))
-                .unwrap_or_else(|error| panic!("parse without plugin failed: {error}"));
-        });
-    });
-
-    group.bench_function("with_fast_plugin", |b| {
-        let mut parser = parser_with_bench_components_and_fast_plugin();
-        b.iter(|| {
-            parser
-                .parse("index.html", black_box(&input))
-                .unwrap_or_else(|error| panic!("parse with fast plugin failed: {error}"));
         });
     });
 
@@ -648,7 +616,6 @@ criterion_group!(
     benches,
     parser_parse_reuse_bench,
     parser_parse_fresh_vs_reuse,
-    parser_plugin_bench,
     parser_css_strategy_bench,
     parser_light_css_global_bench,
     parser_size_sweep_bench,

@@ -248,9 +248,9 @@ Closed roots and invalid values or placement always fail the build. Native
 Light components.
 
 FAST 2/3 plugins currently require effective Shadow components. Combining
-`--plugin fast`, `fast-v2`, or `fast-v3` with an unwrapped component under
-`--dom light` fails with `fast-light-dom-unsupported` instead of allowing the
-FAST client runtime to replace Light SSR with a Shadow root.
+`--plugin fast`, `fast-v2`, or `fast-v3` with an effective Light component
+fails with `fast-light-dom-unsupported` instead of allowing the FAST client
+runtime to replace Light SSR with a Shadow root.
 
 See [Performance - Light DOM vs Shadow DOM](/guide/concepts/performance#light-dom-vs-shadow-dom) for benchmarks and guidance.
 
@@ -757,7 +757,7 @@ webui build ./my-app --out ./dist \
 
 ### Caching
 
-Discovered npm package components are cached at `~/.webui/cache/components/` to avoid re-traversing on every build. The cache is automatically invalidated when a package's `package.json` changes. Local path sources are always re-scanned.
+Discovered npm package components are cached at `~/.webui/cache/components/` to avoid re-traversing on every build. The cache is automatically invalidated when `package.json` or any template, stylesheet, or manifest used by the selected discovery plugin changes. Local path sources are always re-scanned.
 
 ## Next Steps
 

@@ -8,8 +8,8 @@
 //! and emit per-element hydration metadata for the handler.
 
 pub mod fast;
-pub mod fast_v2;
-pub mod fast_v3;
+pub use fast::v2 as fast_v2;
+pub use fast::v3 as fast_v3;
 pub mod webui;
 
 use crate::component_registry::Component;
@@ -65,7 +65,7 @@ impl StateSurface {
 pub struct ComponentTemplateArtifact {
     /// Component custom-element tag name.
     pub tag_name: String,
-    /// Non-WebUI plugin template payload, such as FAST `<f-template>` HTML.
+    /// Plugin-owned client template payload.
     pub template: String,
     /// WebUI JSON-safe template metadata.
     pub template_json: String,
@@ -162,11 +162,7 @@ impl ComponentTemplateArtifact {
     }
 }
 
-/// How a component's compiled CSS is delivered, as resolved by the build.
-///
-/// This is a neutral statement of fact about the component, not a request:
-/// WebUI installs its own stylesheets from precomputed style closures, so its
-/// templates stay style-free and most plugins ignore this entirely.
+/// Build-resolved CSS delivery for a component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentStyleDelivery<'a> {
     /// An external stylesheet served at `href`.
@@ -187,71 +183,142 @@ pub enum ComponentStyleDelivery<'a> {
     },
 }
 
-/// Build-time component context resolved before a parser plugin observes the
-/// processed template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ComponentTemplateContext<'a> {
+/// A component template after the parser has resolved its build behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct ComponentBuildContext<'a> {
+    /// Registered component definition.
+    pub component: &'a Component,
+    /// Final template view intended for the plugin runtime.
+    pub template: &'a str,
     /// Whether this component effectively uses Shadow DOM.
     pub uses_shadow_dom: bool,
-    /// How this component's CSS is delivered, when it has any.
-    ///
-    /// A plugin whose client runtime builds roots from the template it captures
-    /// here is outside WebUI's style registry, so it can use this to keep those
-    /// roots styled. Light CSS belongs to the containing CSS tree rather than
-    /// the captured component template, so delivery is reported only for
-    /// components that effectively use a Shadow root.
+    /// CSS delivery for effective Shadow DOM components.
     pub style: Option<ComponentStyleDelivery<'a>>,
+}
+
+/// A fragment about to be parsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FragmentContext<'a> {
+    /// Stable fragment identifier.
+    pub id: &'a str,
+}
+
+/// An attribute encountered on an opening tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttributeContext<'a> {
+    /// Authored attribute name.
+    pub name: &'a str,
+}
+
+/// An opening tag after all attributes have been processed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ElementStartContext<'a> {
+    /// Authored element tag name.
+    pub tag_name: &'a str,
+    /// Number of dynamic attribute bindings on the element.
+    pub binding_count: u32,
+}
+
+/// Borrowed authored component source presented to a parser plugin before the
+/// component registry stores it.
+#[derive(Debug, Clone, Copy)]
+pub struct ComponentSource<'a> {
+    /// Filename-derived custom-element tag name.
+    pub tag_name: &'a str,
+    /// Authored HTML template for the component.
+    pub html_content: &'a str,
+}
+
+/// Owned replacement views produced by a plugin's component-source transform.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransformedComponentSource {
+    /// Resolved registry key. May differ from the filename-derived tag when the
+    /// authored source names the component itself.
+    pub tag_name: String,
+    /// Content the WebUI SSR parser consumes for this component.
+    pub parser_content: String,
+    /// Optional distinct authored source retained for the plugin's client
+    /// artifact. `None` reuses `parser_content` for the artifact.
+    pub artifact_content: Option<String>,
+}
+
+/// Stateless source transform installed into a [`ComponentRegistry`].
+///
+/// It may resolve the registry key and provide separate SSR and client views.
+/// Returning `Ok(None)` preserves the authored source without allocation.
+///
+/// # Errors
+///
+/// Returns a [`crate::Diagnostic`]-carrying error when the authored source is
+/// invalid.
+///
+/// [`ComponentRegistry`]: crate::component_registry::ComponentRegistry
+pub type ComponentSourceTransform =
+    for<'a> fn(ComponentSource<'a>) -> Result<Option<TransformedComponentSource>>;
+
+/// Static component-processing behavior for a parser plugin.
+///
+/// The parser reads this once during construction and keeps it on the direct
+/// path, avoiding repeated virtual calls while compiling component templates.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ComponentProcessing {
+    /// Optional build-time source transformation.
+    pub source_transform: Option<ComponentSourceTransform>,
+    /// Keep root-template runtime attributes for [`ParserPlugin::process_attribute`].
+    pub process_root_template_attributes: bool,
+    /// Place inline component styles after template content.
+    pub inline_styles_after_content: bool,
 }
 
 /// A parser plugin that can customize template parsing behavior.
 ///
-/// Plugins receive callbacks at key points during HTML parsing:
-/// - **Fragment lifecycle**: `start_fragment` before a fragment parse begins
-/// - **Component registration**: `register_component_template` when a plugin-facing component template is finalized
-/// - **Attribute classification**: `classify_attribute` for framework-specific attrs
-/// - **Element completion**: `finish_element` after attributes are processed
+/// Plugins receive callbacks at explicit lifecycle points: parser setup,
+/// fragment start, component build, attribute processing, opening-tag
+/// completion, and build completion. Every callback has a no-op default.
 ///
 /// WebUI calls these hooks during parsing; plugins decide what (if anything) to do.
 pub trait ParserPlugin {
+    /// Configure the plugin before parsing or component registration begins.
+    fn configure_parser(&mut self, _options: &ParserOptions) {}
+
+    /// Return static component-processing behavior.
+    fn component_processing(&self) -> ComponentProcessing {
+        ComponentProcessing::default()
+    }
+
     /// Called before parsing begins for a fragment.
     ///
     /// Plugins can use this to reset fragment-local counters while preserving
     /// global build-level state such as tracked component templates.
-    fn start_fragment(&mut self, _fragment_id: &str) {}
+    fn begin_fragment(&mut self, _context: FragmentContext<'_>) {}
 
-    /// Called when parser output options change.
-    fn configure(&mut self, _options: &ParserOptions) {}
-
-    /// Called with the plugin-facing component template and its resolved build
-    /// context. Authored root `<template>` attributes are preserved here; the
-    /// SSR/internal parse view may strip runtime-only attributes.
+    /// Called after a component template is fully built.
     ///
-    /// `component` identifies whether browser code owns the tag. Exact
-    /// JavaScript state surfaces come from bundler projection metadata rather
-    /// than parser-side source analysis.
-    fn register_component_template(
-        &mut self,
-        tag_name: &str,
-        component: &Component,
-        processed_template: &str,
-        context: ComponentTemplateContext<'_>,
-    ) -> Result<()>;
+    /// # Errors
+    ///
+    /// Returns an error when the plugin cannot compile or retain the component.
+    fn component_built(&mut self, _context: ComponentBuildContext<'_>) -> Result<()> {
+        Ok(())
+    }
 
-    /// Decide how a framework-owned attribute should be handled.
-    fn classify_attribute(&mut self, attr_name: &str) -> AttributeAction;
+    /// Process one authored attribute.
+    fn process_attribute(&mut self, _context: AttributeContext<'_>) -> AttributeAction {
+        AttributeAction::Keep
+    }
 
-    /// Called after all attributes on an element have been processed.
-    /// `binding_attribute_count` is the number of dynamic attribute bindings found.
+    /// Called after all attributes on an opening tag have been processed.
     /// Returns optional opaque bytes to emit as a `Plugin` protocol fragment.
-    fn finish_element(&mut self, binding_attribute_count: u32) -> Option<Vec<u8>>;
+    fn finish_opening_tag(&mut self, _context: ElementStartContext<'_>) -> Option<Vec<u8>> {
+        None
+    }
 
-    /// Consume the plugin and return any build artifacts it captured.
+    /// Complete the build and return any captured artifacts.
     ///
     /// # Errors
     ///
     /// Returns an error if the plugin encountered an invalid template construct
     /// while producing its artifacts (e.g. an invalid `@event` handler).
-    fn into_artifacts(self: Box<Self>) -> Result<ParserPluginArtifacts> {
+    fn finish(self: Box<Self>) -> Result<ParserPluginArtifacts> {
         Ok(ParserPluginArtifacts::None)
     }
 }
@@ -284,7 +351,7 @@ mod artifact_tests {
     }
 
     #[test]
-    fn with_hydration_attaches_surface_fluently() {
+    fn with_hydration_attaches_custom_surface() {
         let artifact =
             ComponentTemplateArtifact::webui("x-c".into(), "{}".into(), "[]".into(), false)
                 .with_hydration(StateSurface::keys(vec!["count".into(), "name".into()]));

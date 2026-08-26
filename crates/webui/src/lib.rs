@@ -61,6 +61,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
+use webui_discovery::{DiscoveryPlugin, FastDiscoveryPlugin, WebUIDiscoveryPlugin};
 use webui_parser::plugin::fast_v2::FastV2ParserPlugin;
 use webui_parser::plugin::fast_v3::FastV3ParserPlugin;
 use webui_parser::plugin::webui::WebUIParserPlugin;
@@ -548,21 +549,47 @@ fn build_protocol_inner(options: &BuildOptions) -> Result<RawBuildOutput, WebUIE
         }
         None => HtmlParser::with_options(parser_options),
     };
+    let discovery_plugin: Box<dyn DiscoveryPlugin> = match options.plugin {
+        Some(Plugin::Fast | Plugin::FastV2 | Plugin::FastV3) => {
+            Box::new(FastDiscoveryPlugin::new())
+        }
+        Some(Plugin::WebUI) | None => Box::new(WebUIDiscoveryPlugin::new()),
+    };
 
-    // Register app directory components
-    parser
-        .component_registry_mut()
-        .register_from_paths(&[&options.app_dir])
-        .map_err(|e| {
-            WebUIError::ComponentRegistration(format!(
-                "Failed to register components from {}: {e}",
+    let app_components = discovery_plugin
+        .discover_local(&options.app_dir)
+        .map_err(|error| {
+            WebUIError::ComponentDiscovery(format!(
+                "Failed to discover components from {}: {error}",
                 options.app_dir.display()
             ))
         })?;
+    for component in &app_components {
+        parser
+            .component_registry_mut()
+            .register_component(webui_parser::ComponentRegistration {
+                tag_name: &component.tag_name,
+                html_content: &component.html_content,
+                css_content: component.css_content.as_deref(),
+                is_client_owned: component.is_client_owned,
+            })
+            .map_err(|source| WebUIError::ComponentRegistration {
+                context: format!(
+                    "Failed to register component '{}' from {}",
+                    component.tag_name, component.source
+                ),
+                source,
+            })?;
+    }
 
     // Discover and register external component sources
     for source in &options.components {
-        let result = webui_discovery::discover_source(source, &options.app_dir).map_err(|e| {
+        let result = webui_discovery::discover_source_with_plugin(
+            source,
+            &options.app_dir,
+            discovery_plugin.as_ref(),
+        )
+        .map_err(|e| {
             WebUIError::ComponentDiscovery(format!(
                 "Failed to discover components from {source}: {e}"
             ))
@@ -578,11 +605,12 @@ fn build_protocol_inner(options: &BuildOptions) -> Result<RawBuildOutput, WebUIE
                     css_content: comp.css_content.as_deref(),
                     is_client_owned: comp.is_client_owned,
                 })
-                .map_err(|e| {
-                    WebUIError::ComponentRegistration(format!(
-                        "Failed to register component '{}' from {}: {e}",
+                .map_err(|source| WebUIError::ComponentRegistration {
+                    context: format!(
+                        "Failed to register component '{}' from {}",
                         comp.tag_name, comp.source
-                    ))
+                    ),
+                    source,
                 })?;
         }
     }
@@ -1036,6 +1064,8 @@ mod tests {
             ..default_options(app_dir)
         }
     }
+
+    mod fast;
 
     #[test]
     fn test_build_simple_html() {
@@ -2435,60 +2465,6 @@ mod tests {
     }
 
     #[test]
-    fn test_css_public_base_keeps_shadow_fast_template_styled() {
-        let app = create_app_dir(&[
-            ("index.html", "<my-card>Hello</my-card>"),
-            (
-                "my-card.html",
-                r#"<template shadowrootmode="open"><div><slot></slot></div></template>"#,
-            ),
-            ("my-card.css", ".card { color: red; }"),
-        ]);
-        let mut options = default_options(app.path());
-        options.plugin = Some(Plugin::FastV3);
-        options.css_file_name_template = "[name]-[hash].[ext]".to_string();
-        options.css_public_base = Some("https://cdn.example.com/assets".to_string());
-        let result = build(options).unwrap();
-
-        let filename = &result.css_files[0].0;
-        let expected_href = format!("https://cdn.example.com/assets/{filename}");
-        let template = &result.protocol.components["my-card"].template;
-        assert_eq!(
-            result.protocol.component_style_resource("my-card"),
-            Some(expected_href.as_str())
-        );
-        assert!(
-            template.contains(&expected_href),
-            "a Shadow FAST template owns its own CSS so client-created elements are styled: {template}"
-        );
-    }
-
-    /// FAST has no artifact-level Light registration contract and defaults
-    /// client-created elements to Shadow roots, so reject the SSR/client split.
-    #[test]
-    fn test_light_fast_build_is_rejected() {
-        let app = create_app_dir(&[
-            ("index.html", "<my-card>Hello</my-card>"),
-            ("my-card.html", "<div>card</div>"),
-            ("my-card.css", ".card { color: red; }"),
-        ]);
-        let mut options = default_options(app.path());
-        options.dom = DomStrategy::Light;
-        options.plugin = Some(Plugin::FastV3);
-        options.css_file_name_template = "[name]-[hash].[ext]".to_string();
-        options.css_public_base = Some("https://cdn.example.com/assets".to_string());
-        let error = build(options).expect_err("FAST Light build must fail");
-        assert!(matches!(
-            error,
-            WebUIError::Parse {
-                source: webui_parser::ParserError::Template(ref diagnostic),
-                ..
-            } if diagnostic.error_code()
-                == Some(webui_parser::codes::FAST_LIGHT_DOM_UNSUPPORTED)
-        ));
-    }
-
-    #[test]
     fn test_invalid_css_template_is_rejected() {
         let app = create_app_dir(&[
             ("index.html", "<my-card>Hello</my-card>"),
@@ -3624,20 +3600,6 @@ mod tests {
 
         assert!(result.stats.fragment_count > 0);
         assert_eq!(result.stats.css_file_count, 0);
-    }
-
-    #[test]
-    fn test_build_with_fast_plugin() {
-        let app = create_app_dir(&[("index.html", "<h1>Hello</h1>")]);
-        let mut options = default_options(app.path());
-        options.plugin = Some(Plugin::FastV3);
-
-        let result = build(options).unwrap();
-        assert!(result.protocol.fragments.contains_key("index.html"));
-        assert_eq!(
-            result.protocol.initial_state_strategy,
-            webui_protocol::InitialStateStrategy::Full as i32
-        );
     }
 
     #[test]

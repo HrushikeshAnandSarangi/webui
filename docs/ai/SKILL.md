@@ -980,9 +980,9 @@ the router for routed components.
   Document is applied before `</head>`. ShadowRoot-targeted Link CSS is preloaded
   from the head and applied inside its owning root. Static request-reachable
   Shadow roots are preloaded the same way.
-- FAST 2/3 plugins require effective Shadow components. An unwrapped component
-  under `dom: "light"` fails with `fast-light-dom-unsupported`; use the WebUI
-  plugin for global Light DOM.
+- FAST 2/3 plugins require effective Shadow components. Any effective Light
+  component fails with `fast-light-dom-unsupported`; use the WebUI plugin for
+  global Light DOM.
 
 | Attribute | Example | Description |
 |---|---|---|
@@ -1304,6 +1304,26 @@ page-scoped `scriptFile`. Omit `html`/`htmlFile` to retain the fallback. Regions
 resolve before component discovery and compilation; do not manually register
 their components elsewhere. See [WebUI Press named regions](/guide/webui-press)
 for the stable built-in region list and full configuration contract.
+
+**FAST authored templates.** The `fast-v2` and `fast-v3` plugins are pinned to
+FAST major versions 2 and 3, respectively; `fast` is a deprecated alias for
+`fast-v2`. With either versioned plugin, a component file authored as one
+`<f-template name="...">` wrapping one direct inner `<template>` is recognized:
+a non-empty `name` sets the component tag (else the filename without
+`.template.html` is kept), `<f-repeat>` and `<f-when>` provide repetition and
+conditions, and client bindings (`@event`, `:property`, `f-ref`, `f-slotted`, `f-children`) may
+be authored directly on the root `<template>`. The verbatim FAST filename
+`<component>.template.html` is discovered even though its stem has no hyphen,
+registering under the authored `name`. In npm packages, the FAST discovery
+plugin uses Custom Elements Manifest declarations and generated sibling
+`<component>.template.html` files; optional styles use
+`<component>.styles.css` or `<component>.css`. Wrapper shadow options include
+`shadowrootmode` and `shadowrootdelegatesfocus`. A leading generated
+`{{styles}}` marker is reserved for CSS injection. A directive takes only
+`value`; unsupported FAST syntax fails the build. Without a FAST plugin,
+`<f-template>` markup passes through unchanged. See
+[Plugins](/guide/concepts/plugins/) for the complete public authoring and
+package-layout contract.
 
 ```json
 {
