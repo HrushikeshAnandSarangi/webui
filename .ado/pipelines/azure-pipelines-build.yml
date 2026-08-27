@@ -33,16 +33,21 @@ stages:
         script: |
           set -euo pipefail
 
+          # Production builds are allowed from `main`, or from a hotfix branch
+          # or tag (refs/heads/hotfix/* or a v*-hotfix.N tag). Everything else
+          # must use validationMode=true.
           if [[ "$ALLOW_EXISTING_RELEASE" != true ]] &&
-            [[ "$BUILD_SOURCEBRANCH" != refs/heads/main ]]; then
-            echo "##vso[task.logissue type=error]Production release builds must run from refs/heads/main. Use validationMode=true for other branches."
+            [[ "$BUILD_SOURCEBRANCH" != refs/heads/main ]] &&
+            [[ "$BUILD_SOURCEBRANCH" != refs/heads/hotfix/* ]] &&
+            [[ "$BUILD_SOURCEBRANCH" != refs/tags/v*-hotfix.* ]]; then
+            echo "##vso[task.logissue type=error]Production release builds must run from refs/heads/main, a hotfix branch (refs/heads/hotfix/*), or a hotfix tag (refs/tags/v*-hotfix.*). Use validationMode=true for other branches."
             exit 1
           fi
 
           release_version=$(awk '
             $0 == "[workspace.package]" { in_workspace = 1; next }
             /^\[/ { in_workspace = 0 }
-            in_workspace && /^version = "[0-9]+\.[0-9]+\.[0-9]+"$/ {
+            in_workspace && /^version = "[0-9]+\.[0-9]+\.[0-9]+(-hotfix\.[0-9]+)?"$/ {
               value = $0
               sub(/^version = "/, "", value)
               sub(/"$/, "", value)
@@ -50,8 +55,8 @@ stages:
               exit
             }
           ' Cargo.toml)
-          if [[ ! "$release_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "##vso[task.logissue type=error]Cargo.toml must contain a stable workspace version."
+          if [[ ! "$release_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-hotfix\.[1-9][0-9]*)?$ ]]; then
+            echo "##vso[task.logissue type=error]Cargo.toml must contain a stable workspace version (optionally with a -hotfix.N suffix)."
             exit 1
           fi
 
@@ -486,6 +491,12 @@ stages:
           set -euo pipefail
           : "${RELEASE_VERSION:?RELEASE_VERSION is required}"
           : "${SOURCE_DATE_EPOCH:?SOURCE_DATE_EPOCH is required}"
+          # Hotfix versions (`-hotfix.N`) are invalid PEP 440, so maturin encodes
+          # the Python wheel/sdist version as a post-release (`.postN`). This
+          # mirrors `xtask/src/version.rs::python_pep440_version` (it cannot call
+          # it, since this runs before the Rust toolchain is guaranteed); if that
+          # function ever changes, keep this substitution in sync.
+          PEP440_RELEASE_VERSION="${RELEASE_VERSION/-hotfix./.post}"
           sudo apt-get update -q
           sudo apt-get install -y -q protobuf-compiler
           rustup toolchain install 1.93 --profile minimal
@@ -499,13 +510,13 @@ stages:
           trap 'rm -rf target/package' EXIT
           CARGO_HOME="$CARGO_CACHE_HOME" cargo +1.93 xtask publish-stage --pack-only --profile release
           python crates/webui-python/tests/validate_artifacts.py \
-            "publish/python/microsoft_webui-${RELEASE_VERSION}-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
-            "publish/python/microsoft_webui-${RELEASE_VERSION}-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" \
-            "publish/python/microsoft_webui-${RELEASE_VERSION}-cp311-abi3-win_amd64.whl" \
-            "publish/python/microsoft_webui-${RELEASE_VERSION}-cp311-abi3-win_arm64.whl" \
-            "publish/python/microsoft_webui-${RELEASE_VERSION}-cp311-abi3-macosx_10_12_x86_64.whl" \
-            "publish/python/microsoft_webui-${RELEASE_VERSION}-cp311-abi3-macosx_11_0_arm64.whl" \
-            "publish/python/microsoft_webui-${RELEASE_VERSION}.tar.gz"
+            "publish/python/microsoft_webui-${PEP440_RELEASE_VERSION}-cp311-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl" \
+            "publish/python/microsoft_webui-${PEP440_RELEASE_VERSION}-cp311-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl" \
+            "publish/python/microsoft_webui-${PEP440_RELEASE_VERSION}-cp311-abi3-win_amd64.whl" \
+            "publish/python/microsoft_webui-${PEP440_RELEASE_VERSION}-cp311-abi3-win_arm64.whl" \
+            "publish/python/microsoft_webui-${PEP440_RELEASE_VERSION}-cp311-abi3-macosx_10_12_x86_64.whl" \
+            "publish/python/microsoft_webui-${PEP440_RELEASE_VERSION}-cp311-abi3-macosx_11_0_arm64.whl" \
+            "publish/python/microsoft_webui-${PEP440_RELEASE_VERSION}.tar.gz"
       env:
         PNPM_STORE_PATH: $(PNPM_STORE_PATH)
         RELEASE_VERSION: $(releaseVersion)

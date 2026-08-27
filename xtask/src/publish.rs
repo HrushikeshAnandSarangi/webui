@@ -692,10 +692,13 @@ fn build_python_wheel(root: &Path, triple: &str, out_dir: &Path) -> Result<Strin
     run_command_quiet(&interpreter, &maturin_args, Some(root))
         .map_err(|e| format!("maturin build failed: {e}"))?;
 
+    let workspace_version = crate::version::read_version()
+        .map_err(|e| format!("failed to read the workspace version: {e}"))?;
+    // maturin encodes the wheel version in PEP 440 form; hotfix versions map to
+    // a post-release (see `version::python_pep440_version`).
     let expected = format!(
         "{PYTHON_DISTRIBUTION_NAME}-{}-{}.whl",
-        crate::version::read_version()
-            .map_err(|e| format!("failed to read the workspace version: {e}"))?,
+        crate::version::python_pep440_version(&workspace_version),
         expected_python_wheel_tag(platform)
     );
     if !out_dir.join(&expected).is_file() {
@@ -1447,7 +1450,10 @@ fn validate_python_release_artifacts(publish: &Path, version: &str) -> Result<()
     let entries = fs::read_dir(&python_dir)
         .map_err(|e| format!("failed to read {}: {e}", python_dir.display()))?;
 
-    let wheel_prefix = format!("{PYTHON_DISTRIBUTION_NAME}-{version}-");
+    // maturin encodes the wheel/sdist version in PEP 440 form
+    // (hotfix `-hotfix.N` -> `.postN`); validate against the mapped form.
+    let pep440_version = crate::version::python_pep440_version(version);
+    let wheel_prefix = format!("{PYTHON_DISTRIBUTION_NAME}-{pep440_version}-");
     let mut wheel_tags: Vec<String> = Vec::new();
     let mut sdist_names: Vec<String> = Vec::new();
 
@@ -1481,7 +1487,7 @@ fn validate_python_release_artifacts(publish: &Path, version: &str) -> Result<()
 
     validate_python_wheel_tags(&wheel_tags)?;
 
-    let expected_sdist = format!("{PYTHON_DISTRIBUTION_NAME}-{version}.tar.gz");
+    let expected_sdist = format!("{PYTHON_DISTRIBUTION_NAME}-{pep440_version}.tar.gz");
     if sdist_names.len() != 1 {
         return Err(format!(
             "expected 1 Python sdist named {expected_sdist}, found {}; \

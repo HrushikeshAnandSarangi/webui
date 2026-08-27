@@ -21,6 +21,7 @@ resources:
       branches:
         include:
         - main
+        - hotfix/*
       stages:
       - BuildArtifacts
   repositories:

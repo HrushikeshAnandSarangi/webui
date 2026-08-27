@@ -71,6 +71,43 @@ Common commands:
 | `cargo xtask bench <target>` | Run benchmarks |
 | `cargo xtask build-windows-local` | Manually build and stage Windows MSVC artifacts on macOS |
 
+### Hotfix releases
+
+A hotfix back-ports a fix to an already-released line without waiting for the
+next feature release. It branches off the release tag, bumps the version to
+`<X.Y.Z>-hotfix.<N>`, and tags the result so the release pipeline can sign and
+publish it.
+
+```bash
+# Preview what a hotfix would do (no changes made):
+cargo xtask hotfix <sha> --tag 0.0.27 --dry-run
+
+# Cut a hotfix for one release, branch + tag locally:
+cargo xtask hotfix <sha> --tag 0.0.27 --push
+
+# Cut hotfixes for every release newer than 0.0.26, and print the Azure
+# DevOps pipeline-run step for each:
+cargo xtask hotfix <sha> 0.0.26 --register
+
+# List release and existing hotfix tags:
+cargo xtask hotfix --list
+```
+
+Each hotfix produces a `hotfix/<X.Y.Z>` branch and a `v<X.Y.Z>-hotfix.<N>` tag
+(`N` auto-increments). Cherry-pick conflicts are never auto-resolved — the
+command aborts so you can resolve them manually. After pushing, run the
+**Web UI - CD** Azure DevOps pipeline on the hotfix branch to sign and publish.
+
+A hotfix version (`X.Y.Z-hotfix.N`) is not valid [PEP 440], which is what
+maturin requires for the Python wheel/sdist filenames. `cargo xtask version`
+therefore writes the Python `pyproject.toml` version in the mapped
+post-release form (`X.Y.Z.postN`), while Rust/npm/NuGet keep the `-hotfix.N`
+form. The wheel/sdist filenames and every Python artifact check use this mapped
+version.
+
+[PEP 440]: https://peps.python.org/pep-0440/
+
+
 ### Manual Windows builds on macOS
 
 `cargo xtask build-windows-local` is a local-only helper for producing Windows

@@ -4,7 +4,11 @@ build-backend = "maturin"
 
 [project]
 name = "microsoft-webui"
-dynamic = ["version"]
+# The Python version is managed explicitly (rather than `dynamic = ["version"]`
+# from the Cargo workspace) because maturin's wheel/sdist filenames require a
+# valid PEP 440 version. Hotfix versions (`X.Y.Z-hotfix.N`, which are invalid
+# PEP 440) are mapped to a post-release (`X.Y.Z.postN`) by `cargo xtask version`.
+version = "0.0.27"
 description = "High-performance Python renderer for compiled WebUI applications"
 readme = "README.md"
 requires-python = ">=3.11"

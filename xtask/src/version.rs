@@ -28,6 +28,9 @@ enum UpdateStrategy {
     CrateDeps,
     /// Replace `<Version>…</Version>` in a .NET `Directory.Build.props`.
     DotnetProps,
+    /// Replace `version = "..."` in the Python `[project]` section, mapped to a
+    /// PEP 440 form (hotfix -> post-release) so maturin accepts it.
+    PythonPyproject,
 }
 
 /// A single file whose version must be updated.
@@ -67,6 +70,20 @@ fn discover_targets(root: &Path) -> Vec<VersionTarget> {
         });
     }
 
+    // crates/webui-python/pyproject.toml (only if present) — Python's wheel/sdist
+    // version is stored in PEP 440 form (hotfix -> post-release).
+    let python_pyproject = root
+        .join("crates")
+        .join("webui-python")
+        .join("pyproject.toml");
+    if python_pyproject.exists() {
+        targets.push(VersionTarget {
+            path: python_pyproject,
+            strategy: UpdateStrategy::PythonPyproject,
+            required: true,
+        });
+    }
+
     // crates/*/Cargo.toml – inter-crate dependency versions
     for toml in find_crate_cargo_tomls(root) {
         targets.push(VersionTarget {
@@ -97,6 +114,7 @@ fn execute_update(target: &VersionTarget, version: &str) -> Result<bool, String>
         UpdateStrategy::PackageJson => update_package_json(&target.path, version),
         UpdateStrategy::CrateDeps => update_crate_dep_versions(&target.path, version),
         UpdateStrategy::DotnetProps => update_dotnet_version(&target.path, version),
+        UpdateStrategy::PythonPyproject => update_python_pyproject_version(&target.path, version),
     }
 }
 
@@ -143,13 +161,41 @@ fn apply_update(
     }
 }
 
-/// Validate a semver string (basic check: major.minor.patch).
+/// Validate a semver string (basic check: major.minor.patch), optionally
+/// carrying a `-hotfix.<N>` pre-release suffix (e.g. `0.0.27-hotfix.1`).
 fn is_valid_semver(version: &str) -> bool {
-    let parts: Vec<&str> = version.split('.').collect();
+    // Strip an optional hotfix suffix before validating the numeric core.
+    let core = match version.split_once("-hotfix.") {
+        Some((head, tail)) => {
+            match tail.parse::<u64>() {
+                Ok(0) | Err(_) => return false,
+                Ok(_) => {}
+            }
+            head
+        }
+        None => version,
+    };
+    let parts: Vec<&str> = core.split('.').collect();
     if parts.len() != 3 {
         return false;
     }
     parts.iter().all(|p| p.parse::<u64>().is_ok())
+}
+
+/// Map a workspace version to the PEP 440 form used for the Python wheel/sdist.
+///
+/// Hotfix versions (`X.Y.Z-hotfix.N`) are not valid PEP 440 (maturin rejects
+/// them), so they map to a post-release (`X.Y.Z.postN`) which sorts immediately
+/// after the `X.Y.Z` release — matching "a hotfix on top of that release".
+/// Any other version — including plain `X.Y.Z` releases — is returned unchanged.
+pub fn python_pep440_version(version: &str) -> String {
+    let Some((core, num)) = version.split_once("-hotfix.") else {
+        return version.to_string();
+    };
+    let Ok(n) = num.parse::<u64>() else {
+        return version.to_string();
+    };
+    format!("{core}.post{n}")
 }
 
 /// Update `version = "..."` inside a specific TOML section of a file.
@@ -374,6 +420,15 @@ fn update_dotnet_version(path: &Path, version: &str) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Update `version = "..."` in the `[project]` section of the Python
+/// `pyproject.toml`, mapping the workspace version through
+/// [`python_pep440_version`] (hotfix -> post-release) so maturin's wheel/sdist
+/// filenames stay valid PEP 440.
+fn update_python_pyproject_version(path: &Path, version: &str) -> Result<bool, String> {
+    let pep440 = python_pep440_version(version);
+    update_toml_section_version(path, "[project]", &pep440)
+}
+
 /// Find all package.json files under `packages/`.
 fn find_package_jsons(root: &Path) -> Vec<PathBuf> {
     let packages_dir = root.join("packages");
@@ -506,6 +561,8 @@ mod tests {
         assert!(is_valid_semver("0.1.0"));
         assert!(is_valid_semver("1.0.0"));
         assert!(is_valid_semver("12.34.56"));
+        assert!(is_valid_semver("0.0.27-hotfix.1"));
+        assert!(is_valid_semver("0.0.27-hotfix.12"));
     }
 
     #[test]
@@ -516,6 +573,61 @@ mod tests {
         assert!(!is_valid_semver("abc"));
         assert!(!is_valid_semver("1.0.beta"));
         assert!(!is_valid_semver("v1.0.0"));
+        assert!(!is_valid_semver("0.0.27-hotfix.0"));
+        assert!(!is_valid_semver("0.0.27-hotfix"));
+        assert!(!is_valid_semver("0.0.27-hotfix.foo"));
+    }
+
+    #[test]
+    fn test_python_pep440_version() {
+        assert_eq!(python_pep440_version("0.0.27"), "0.0.27");
+        assert_eq!(python_pep440_version("1.2.3"), "1.2.3");
+        assert_eq!(python_pep440_version("0.0.27-hotfix.1"), "0.0.27.post1");
+        assert_eq!(python_pep440_version("0.0.27-hotfix.12"), "0.0.27.post12");
+        assert_eq!(python_pep440_version("1.2.3-hotfix.2"), "1.2.3.post2");
+        // Unrecognized suffixes are left untouched (identity).
+        assert_eq!(python_pep440_version("0.0.27-hotfix"), "0.0.27-hotfix");
+        assert_eq!(
+            python_pep440_version("0.0.27-hotfix.foo"),
+            "0.0.27-hotfix.foo"
+        );
+        assert_eq!(
+            python_pep440_version("0.0.27-hotfix.1-beta"),
+            "0.0.27-hotfix.1-beta"
+        );
+    }
+
+    #[test]
+    fn test_update_python_pyproject_version_maps_hotfix() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pyproject = dir.path().join("pyproject.toml");
+        fs::write(
+            &pyproject,
+            "[project]\nname = \"microsoft-webui\"\nversion = \"0.0.27\"\n\n[project.urls]\nHomepage = \"https://example.com\"\n",
+        )
+        .unwrap();
+
+        update_python_pyproject_version(&pyproject, "0.0.27-hotfix.2").unwrap();
+
+        let content = fs::read_to_string(&pyproject).unwrap();
+        assert!(content.contains("version = \"0.0.27.post2\""));
+        assert!(!content.contains("0.0.27-hotfix"));
+    }
+
+    #[test]
+    fn test_update_python_pyproject_version_plain_release() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pyproject = dir.path().join("pyproject.toml");
+        fs::write(
+            &pyproject,
+            "[project]\nname = \"microsoft-webui\"\nversion = \"0.0.27\"\n",
+        )
+        .unwrap();
+
+        update_python_pyproject_version(&pyproject, "0.0.28").unwrap();
+
+        let content = fs::read_to_string(&pyproject).unwrap();
+        assert!(content.contains("version = \"0.0.28\""));
     }
 
     #[test]
